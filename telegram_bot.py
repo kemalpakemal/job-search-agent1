@@ -24,10 +24,10 @@ _offset = 0
 
 MAIN_MENU = {
     "keyboard": [
-        [{"text": "🔎 Найти вакансии"}, {"text": "📋 Подходящие"}],
-        [{"text": "🕵 Проверить"}, {"text": "⭐ Сохранённые"}],
-        [{"text": "📊 Статистика"}, {"text": "⚙️ Настройки"}],
-        [{"text": "🔌 Источники"}, {"text": "❔ Помощь"}],
+        [{"text": "Найти вакансии"}, {"text": "Подходящие"}],
+        [{"text": "Проверить"}, {"text": "Сохранённые"}],
+        [{"text": "Статистика"}, {"text": "Настройки"}],
+        [{"text": "Источники"}, {"text": "Помощь"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -251,7 +251,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
             await _send(int(chat_id), "Команды:\n/search — поиск сейчас\n/jobs — подходящие\n/review — проверить\n/saved — сохранённые\n/stats — статистика\n/sources — источники\n/settings — параметры\n/id — твой ID", MAIN_MENU)
         return
 
-    if command in {"/search"} or text == "🔎 Найти вакансии":
+    if command in {"/search"} or text in {"Найти вакансии", "🔎 Найти вакансии"}:
         global _search_task
         if _search_fn is None:
             await _send(int(chat_id), "Функция поиска не инициализирована. Проверь журнал сервера.")
@@ -263,16 +263,16 @@ async def _handle_message(update: dict[str, Any]) -> None:
         _search_task = asyncio.create_task(_run_search_for_chat(int(chat_id)), name=f"telegram-search-{chat_id}")
         return
 
-    if command in {"/jobs"} or text == "📋 Подходящие":
+    if command in {"/jobs"} or text in {"Подходящие", "📋 Подходящие"}:
         await _show_next(int(chat_id), "qualified")
         return
-    if command in {"/review"} or text == "🕵 Проверить":
+    if command in {"/review"} or text in {"Проверить", "🕵 Проверить"}:
         await _show_next(int(chat_id), "review")
         return
-    if command in {"/saved"} or text == "⭐ Сохранённые":
+    if command in {"/saved"} or text in {"Сохранённые", "⭐ Сохранённые"}:
         await _show_next(int(chat_id), "saved")
         return
-    if command in {"/stats"} or text == "📊 Статистика":
+    if command in {"/stats"} or text in {"Статистика", "📊 Статистика"}:
         db = SessionLocal()
         try:
             total = _count(db)
@@ -285,7 +285,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
         finally:
             db.close()
         return
-    if command in {"/sources"} or text == "🔌 Источники":
+    if command in {"/sources"} or text in {"Источники", "🔌 Источники"}:
         db = SessionLocal()
         try:
             latest = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(1)).first()
@@ -304,7 +304,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
         finally:
             db.close()
         return
-    if command in {"/settings"} or text == "⚙️ Настройки":
+    if command in {"/settings"} or text in {"Настройки", "⚙️ Настройки"}:
         await _send(
             int(chat_id),
             "Текущие параметры поиска:\n\n"
@@ -314,7 +314,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
             MAIN_MENU,
         )
         return
-    if command == "/help" or text == "❔ Помощь":
+    if command == "/help" or text in {"Помощь", "❔ Помощь"}:
         await _send(int(chat_id), "Команды: /search /jobs /review /saved /stats /sources /settings /id", MAIN_MENU)
         return
 
