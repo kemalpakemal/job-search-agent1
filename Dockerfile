@@ -6,5 +6,6 @@ RUN python -c "import zipfile; zipfile.ZipFile('/tmp/source.zip').extractall('/a
     && pip install --no-cache-dir -r /app/requirements.txt \
     && mkdir -p /data
 COPY scoring.py /app/scoring.py
+COPY connectors.py /app/connectors.py
 EXPOSE 8000
 CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

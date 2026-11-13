@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import re
+from html import unescape as html_unescape
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -40,6 +42,110 @@ def _compact_description(requirement: Any, responsibility: Any, full: Any = None
     return " ".join(x for x in vals if x)[:12000]
 
 
+
+def _rss_plain_text(value: Any) -> str:
+    """Turn RSS HTML fragments into readable text while preserving field boundaries."""
+    text = html_unescape(str(value or ""))
+    text = re.sub(r"(?i)<br\s*/?>|</(?:p|div|li|tr|h[1-6])\s*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\s*\n\s*", "\n", text)
+    return text.strip()
+
+
+def _rss_fields(node: ET.Element) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for child in node:
+        key = child.tag.rsplit("}", 1)[-1].lower()
+        if key == "link":
+            value = child.attrib.get("href") or "".join(child.itertext())
+        else:
+            value = "".join(child.itertext())
+        fields[key] = _rss_plain_text(value)
+    return fields
+
+
+def _rss_labeled_value(text: str, labels: tuple[str, ...]) -> str:
+    names = "|".join(re.escape(label) for label in labels)
+    match = re.search(rf"(?im)(?:^|\\n)\\s*(?:{names})\\s*[:—-]\\s*([^\\n]+)", text)
+    return match.group(1).strip(" \\t.;") if match else ""
+
+
+def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, float | None, str | None, str]:
+    # Parse only lines that look like salary information; do not mistake IDs or other numbers for pay.
+    lines = [line for line in (separate_salary + "\n" + text).splitlines()
+             if any(token in line.lower() for token in ("зарплат", "оплат", "доход", "₽", "руб"))]
+    candidate = " ".join(lines)
+    pattern = (
+        r"(?i)(?:от\\s*)?(\\d[\\d\\s\\u00a0\\u202f]{2,})"
+        r"(?:\\s*(?:[-–—]|до)\\s*(\\d[\\d\\s\\u00a0\\u202f]{2,}))?"
+        r"\\s*(?:₽|руб(?:\\.|лей|ля|ль)?)"
+    )
+    match = re.search(pattern, candidate)
+    if not match:
+        return None, None, None, classify_salary_type(candidate)
+    def to_number(value: str | None) -> float | None:
+        if not value:
+            return None
+        digits = re.sub(r"\\D", "", value)
+        return float(digits) if digits else None
+    low, high = to_number(match.group(1)), to_number(match.group(2))
+    return low, high, "RUB", classify_salary_type(candidate)
+
+
+def _parse_hh_rss(xml_content: bytes, area_name: str = "Сочи") -> list[dict[str, Any]]:
+    """Parse HeadHunter's public RSS search feed into the agent's common vacancy shape."""
+    root = ET.fromstring(xml_content)
+    nodes = [node for node in root.iter() if node.tag.rsplit("}", 1)[-1].lower() in {"item", "entry"}]
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for node in nodes:
+        fields = _rss_fields(node)
+        title = fields.get("title", "").strip()
+        url = fields.get("link") or fields.get("guid") or ""
+        description = fields.get("description") or fields.get("summary") or fields.get("content") or ""
+        if not title or not url:
+            continue
+        id_match = re.search(r"/vacancy/(\\d+)", url)
+        external_id = id_match.group(1) if id_match else (fields.get("guid") or url)
+        if external_id in seen:
+            continue
+        seen.add(external_id)
+        extra_salary = fields.get("salary", "")
+        salary_min, salary_max, currency, salary_type = _rss_salary(description, extra_salary)
+        full_description = " ".join(part for part in (description, extra_salary) if part).strip()[:12000]
+        employer = (
+            fields.get("company") or fields.get("employer")
+            or _rss_labeled_value(description, ("Компания", "Работодатель", "Организация"))
+            or "Работодатель не указан"
+        )
+        schedule = (
+            fields.get("schedule")
+            or _rss_labeled_value(description, ("График работы", "График", "Режим работы"))
+        )
+        experience = (
+            fields.get("experience")
+            or _rss_labeled_value(description, ("Требуемый опыт работы", "Опыт работы", "Опыт"))
+        )
+        result.append({
+            "source": "HeadHunter",
+            "external_id": str(external_id),
+            "title": title,
+            "employer": employer,
+            # The feed request is constrained to the exact Sochi area returned by HH /areas.
+            "city": area_name,
+            "description": full_description,
+            "salary_min": salary_min,
+            "salary_max": salary_max,
+            "currency": currency,
+            "salary_type": salary_type,
+            "schedule": schedule,
+            "experience": experience,
+            "published_at": fields.get("pubdate") or fields.get("published") or fields.get("date"),
+            "url": url,
+        })
+    return result
+
 def _hh_area_id(data: list[dict[str, Any]], wanted: str = "сочи") -> str | None:
     found: list[str] = []
     def walk(node: Any, parent_names: list[str]) -> None:
@@ -73,35 +179,46 @@ class VacancyConnectors:
         return response.json()
 
     async def hh(self) -> tuple[list[dict[str, Any]], str]:
-        headers = {"User-Agent": settings.hh_user_agent}
+        # The anonymous JSON vacancy-search endpoint began returning 403 in 2026.
+        # Use HH's public search RSS instead; no applicant account, app key or CAPTCHA bypass.
+        headers = {
+            "User-Agent": settings.hh_user_agent,
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        }
         if not self._hh_area:
             areas = await self._get_json("https://api.hh.ru/areas", headers=headers)
             self._hh_area = _hh_area_id(areas)
             if not self._hh_area:
                 raise RuntimeError("В справочнике HeadHunter не найден город Сочи в Краснодарском крае")
+
         gathered: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for term in SEARCH_TERMS:
-            data = await self._get_json(
-                "https://api.hh.ru/vacancies",
-                params={"text": term, "area": self._hh_area, "per_page": 30, "page": 0, "order_by": "publication_time"},
+            response = await self.client.get(
+                "https://hh.ru/search/vacancy/rss",
+                params={
+                    "text": term,
+                    "area": self._hh_area,
+                    "clusters": "true",
+                    "enable_snippets": "true",
+                    "order_by": "publication_time",
+                },
                 headers=headers,
             )
-            for item in data.get("items", []):
-                salary = item.get("salary") or {}
-                salary_type = "unknown" if salary.get("gross") is None else ("gross" if salary.get("gross") else "net")
-                desc = _compact_description(item.get("snippet", {}).get("requirement"), item.get("snippet", {}).get("responsibility"))
-                gathered.append({
-                    "source": "HeadHunter", "external_id": str(item.get("id")),
-                    "title": item.get("name", ""), "employer": (item.get("employer") or {}).get("name", "Работодатель не указан"),
-                    "city": (item.get("area") or {}).get("name", ""), "description": desc,
-                    "salary_min": _money(salary.get("from")), "salary_max": _money(salary.get("to")),
-                    "currency": salary.get("currency"), "salary_type": salary_type,
-                    "schedule": (item.get("schedule") or {}).get("name", ""),
-                    "experience": (item.get("experience") or {}).get("name", ""),
-                    "published_at": item.get("published_at"), "url": item.get("alternate_url", ""),
-                })
-            await asyncio.sleep(0.15)
-        return gathered, "API HeadHunter: публичный поиск; OAuth работодателя/соискателя для действий от имени аккаунта настраивается отдельно"
+            response.raise_for_status()
+            for item in _parse_hh_rss(response.content, area_name=settings.target_city):
+                if item["external_id"] in seen:
+                    continue
+                seen.add(item["external_id"])
+                gathered.append(item)
+            await asyncio.sleep(0.25)
+
+        return gathered, (
+            "Публичная RSS-лента поиска HeadHunter; JSON API поиска вакансий "
+            "для неавторизованных запросов возвращает 403. RSS не требует регистрации "
+            "приложения или доступа работодателя; зарплата и график могут отсутствовать "
+            "в кратком описании и тогда вакансия попадёт на ручную проверку."
+        )
 
     async def superjob(self) -> tuple[list[dict[str, Any]], str]:
         if not settings.superjob_app_id:
