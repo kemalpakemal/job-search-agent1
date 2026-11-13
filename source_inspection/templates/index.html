@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101827"><title>Агент поиска работы — Сочи</title>
+<style>
+:root{--bg:#0b1220;--panel:#111c2e;--panel2:#17243a;--text:#eef4ff;--muted:#9baec8;--line:#263750;--accent:#79a9ff;--green:#57d6a0;--yellow:#f1c56b;--red:#ff8b8b}
+*{box-sizing:border-box}body{margin:0;background:linear-gradient(160deg,#0b1220,#111c2e 65%,#0d1728);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}header{padding:22px 18px 14px;border-bottom:1px solid var(--line);position:sticky;top:0;background:#0b1220ee;backdrop-filter:blur(12px);z-index:5}.wrap{max-width:1080px;margin:auto}h1{font-size:clamp(21px,5vw,30px);margin:0 0 4px}h2{font-size:18px;margin:0 0 13px}.sub{color:var(--muted);font-size:13px}.top{display:flex;justify-content:space-between;gap:12px;align-items:center}.pill{font-size:12px;padding:5px 9px;border-radius:100px;border:1px solid var(--line);color:var(--muted)}main{max-width:1080px;margin:auto;padding:18px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:17px}.stat,.panel,.job{background:linear-gradient(145deg,var(--panel),#101a2b);border:1px solid var(--line);border-radius:16px}.stat{padding:13px}.stat b{display:block;font-size:25px}.stat span{color:var(--muted);font-size:12px}.actions{display:flex;gap:9px;flex-wrap:wrap;margin:10px 0 18px}.btn{appearance:none;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:11px 15px;border-radius:11px;font-weight:650;cursor:pointer}.btn.primary{background:#315caa;border-color:#4779d2}.btn:disabled{opacity:.55;cursor:wait}.tabs{display:flex;gap:7px;overflow:auto;padding-bottom:12px}.tab{white-space:nowrap;border:1px solid var(--line);background:transparent;color:var(--muted);padding:9px 12px;border-radius:10px;cursor:pointer}.tab.active{background:var(--panel2);color:var(--text);border-color:#5778a8}.layout{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px}.panel{padding:15px;margin-bottom:14px}.jobs{display:grid;gap:10px}.job{padding:14px}.jobtop{display:flex;justify-content:space-between;gap:10px}.job h3{margin:0 0 4px;font-size:16px}.meta{color:var(--muted);font-size:12px}.money{font-size:15px;font-weight:700;margin:9px 0}.score{font-weight:750;border-radius:9px;padding:5px 8px;background:#1a3853;color:#a8d3ff;white-space:nowrap;height:max-content}.score.high{background:#153b32;color:#75e1b4}.reason{color:#d3dff0;font-size:13px;margin:8px 0}.small{font-size:12px;color:var(--muted)}a{color:#9fc4ff;text-decoration:none}a:hover{text-decoration:underline}.row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.source{padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}.source:last-child{border:0}.status{color:var(--muted);font-size:12px}.warn{border-left:3px solid var(--yellow);padding:8px 10px;color:#e5d7b8;background:#2b271b;border-radius:7px;font-size:12px}.green{color:var(--green)}.yellow{color:var(--yellow)}.red{color:var(--red)}.searchbox{display:flex;gap:7px;margin-bottom:12px}.searchbox input{flex:1;min-width:0;background:#0b1525;color:var(--text);border:1px solid var(--line);padding:10px 12px;border-radius:10px}.empty{color:var(--muted);text-align:center;padding:34px 14px}.hide{display:none}.letter{white-space:pre-wrap;background:#0b1525;border:1px solid var(--line);padding:12px;border-radius:10px;margin-top:9px;font-size:13px}.footer{color:var(--muted);font-size:11px;text-align:center;padding:24px}.tag{font-size:11px;padding:3px 7px;background:#202e43;border-radius:6px;color:#b9cbe3;margin-right:5px}
+@media(max-width:760px){main{padding:13px}.stats{grid-template-columns:repeat(2,1fr)}.layout{grid-template-columns:1fr}.side{order:2}.stat b{font-size:22px}.top{align-items:flex-start}.pill{display:none}}
+</style></head>
+<body>
+<header><div class="wrap top"><div><h1>Агент поиска работы</h1><div class="sub">Сочи · бухгалтерия и расчёт заработной платы</div></div><span class="pill" id="runState">Ожидает запуска</span></div></header>
+<main>
+<div class="stats">
+ <div class="stat"><b id="nTotal">0</b><span>Всего сохранено</span></div>
+ <div class="stat"><b id="nQualified" class="green">0</b><span>Подходят по фильтрам</span></div>
+ <div class="stat"><b id="nReview" class="yellow">0</b><span>Нужна проверка</span></div>
+ <div class="stat"><b id="nRejected" class="red">0</b><span>Ниже требований</span></div>
+</div>
+<div class="actions">
+ <button class="btn primary" id="searchBtn" onclick="runSearch()">▶ Найти новые вакансии</button>
+ <a class="btn" href="/api/export.csv">Экспорт CSV</a>
+ <button class="btn" onclick="refreshAll()">Обновить</button>
+</div>
+<div class="warn" style="margin-bottom:16px">Автоматические отклики отключены. Программа собирает вакансии через доступные API, фильтрует их и готовит письма. Перед отправкой отклика пользователь проверяет вакансию и отправляет его на площадке самостоятельно.</div>
+<div class="layout">
+<section>
+ <div class="tabs">
+  <button class="tab active" data-bucket="qualified" onclick="chooseBucket(this)">Подходящие</button>
+  <button class="tab" data-bucket="review" onclick="chooseBucket(this)">Проверить</button>
+  <button class="tab" data-bucket="rejected" onclick="chooseBucket(this)">Не подходят</button>
+  <button class="tab" data-bucket="all" onclick="chooseBucket(this)">Все</button>
+ </div>
+ <div class="searchbox"><input id="filterText" placeholder="Фильтр по должности или работодателю" oninput="loadVacancies()"></div>
+ <div class="jobs" id="jobs"><div class="empty">Пока вакансий нет. Нажми «Найти новые вакансии».</div></div>
+</section>
+<aside class="side">
+ <div class="panel"><h2>Параметры кандидата</h2>
+  <div class="source"><b>Город</b><div class="status">Сочи, Краснодарский край</div></div>
+  <div class="source"><b>Зарплата</b><div class="status">От 60 000 ₽ на руки</div></div>
+  <div class="source"><b>График</b><div class="status">5/2</div></div>
+  <div class="source"><b>Опыт</b><div class="status">4 года · около 300 лицевых счетов</div></div>
+  <div class="source"><b>Программа</b><div class="status">1С:БГУ, Excel</div></div>
+  <div class="source"><b>Оценка</b><div class="status">Порог — 80 из 100</div></div>
+ </div>
+ <div class="panel"><div class="row"><h2>Источники</h2><span class="small" id="sourceCount">—</span></div><div id="sourcesList" class="small">Статус появится после первого поиска.</div></div>
+ <div class="panel"><h2>История запусков</h2><div id="runsList" class="small">Запусков ещё не было.</div></div>
+ <div class="panel"><h2>Важные настройки</h2><div class="small">API-ключ SuperJob, Telegram и ИИ-провайдер добавляются через переменные окружения. Не вводи пароли и API-ключи в чат или в сопроводительное письмо.</div><p class="small">Для постоянной работы размести приложение на сервере с постоянным хранилищем. Не используй бесплатный хостинг без постоянной базы данных для истории вакансий.</p></div>
+</aside>
+</div>
+<div class="footer">Версия 1.0 · SQLite/PostgreSQL · История хранится в базе данных · Демо-вакансии не создаются</div>
+</main>
+<script>
+let bucket='qualified';
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function money(v){if(v===null||v===undefined)return 'не указана';return Math.round(v).toLocaleString('ru-RU')+' ₽';}
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});if(!r.ok)throw new Error((await r.text()).slice(0,300));return r.json();}
+async function refreshStats(){const s=await api('/api/stats');nTotal.textContent=s.total;nQualified.textContent=s.qualified;nReview.textContent=s.review;nRejected.textContent=s.rejected;runState.textContent=s.last_search?'Последний поиск: '+new Date(s.last_search).toLocaleString('ru-RU'):'Ожидает запуска';}
+async function loadVacancies(){const q=encodeURIComponent(document.getElementById('filterText').value||'');const list=await api(`/api/vacancies?bucket=${bucket}&q=${q}`);const root=document.getElementById('jobs');if(!list.length){root.innerHTML='<div class="empty">В этой категории вакансий пока нет.</div>';return;}root.innerHTML=list.map(v=>`<article class="job">
+<div class="jobtop"><div><h3>${esc(v.title)}</h3><div class="meta">${esc(v.employer)} · ${esc(v.city)} · ${esc(v.source)}</div></div><div class="score ${v.score>=80?'high':''}">${v.score}/100</div></div>
+<div class="money">${v.salary_min?money(v.salary_min):'Зарплата не указана'}${v.salary_max?' — '+money(v.salary_max):''} · ${v.salary_type==='gross'?'до НДФЛ':v.salary_type==='net'?'на руки':'тип не определён'}${v.net_min_estimate?' · оценка NET от '+money(v.net_min_estimate):''}</div>
+<div class="meta">График: ${esc(v.schedule||'не указан')} · Опыт: ${esc(v.experience||'не указан')}</div>
+${v.review_reason?`<div class="reason yellow">Проверка: ${esc(v.review_reason)}</div>`:''}
+<div class="reason">${esc((v.score_reasons||[]).slice(0,4).join(' · '))}</div>
+<div class="row"><a href="${esc(v.url)}" target="_blank" rel="noopener">Открыть вакансию ↗</a><button class="btn" onclick="makeLetter(${v.id})">Сопроводительное письмо</button></div>
+<div id="letter-${v.id}" class="letter hide"></div>
+</article>`).join('');}
+async function loadSources(){const d=await api('/api/sources');const entries=Object.entries(d.sources);sourceCount.textContent=entries.length+' площадок';sourcesList.innerHTML=entries.map(([name,status])=>`<div class="source"><b>${esc(name)}</b><div class="status">${esc(status)}</div></div>`).join('');}
+async function loadRuns(){const runs=await api('/api/runs');runsList.innerHTML=runs.length?runs.map(r=>`<div class="source"><b>${r.finished_at?new Date(r.finished_at).toLocaleString('ru-RU'):'Выполняется'}</b><div class="status">Получено ${r.received} · новых ${r.inserted} · подходят ${r.qualified} · проверить ${r.review}${r.error?' · '+esc(r.error):''}</div></div>`).join(''):'Запусков ещё не было.';}
+async function refreshAll(){try{await Promise.all([refreshStats(),loadVacancies(),loadSources(),loadRuns()]);}catch(e){console.error(e);}}
+async function runSearch(){const b=document.getElementById('searchBtn');b.disabled=true;b.textContent='Ищем вакансии…';runState.textContent='Поиск выполняется';try{const result=await api('/api/search/run',{method:'POST'});alert(`Поиск завершён. Получено: ${result.received}. Новых: ${result.inserted}. Подходят: ${result.qualified}. На проверку: ${result.review}.`);await refreshAll();}catch(e){alert('Не удалось выполнить поиск: '+e.message);}finally{b.disabled=false;b.textContent='▶ Найти новые вакансии';}}
+function chooseBucket(el){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));el.classList.add('active');bucket=el.dataset.bucket;loadVacancies();}
+async function makeLetter(id){const box=document.getElementById('letter-'+id);box.classList.remove('hide');box.textContent='Готовим письмо…';try{const d=await api(`/api/vacancies/${id}/letter`,{method:'POST'});box.textContent=d.letter+'\n\n';const btn=document.createElement('button');btn.className='btn';btn.textContent='Скопировать письмо';btn.onclick=()=>navigator.clipboard.writeText(d.letter);box.appendChild(btn);}catch(e){box.textContent='Ошибка: '+e.message;}}
+refreshAll();setInterval(refreshAll,60000);
+</script></body></html>
