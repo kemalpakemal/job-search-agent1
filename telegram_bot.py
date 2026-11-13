@@ -95,8 +95,8 @@ async def _send(chat_id: int, text: str, reply_markup: dict[str, Any] | None = N
 async def _answer_callback(callback_id: str, text: str = "", alert: bool = False) -> None:
     try:
         await _call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:180], "show_alert": alert})
-    except Exception:
-        log.exception("Could not answer Telegram callback")
+    except Exception as exc:
+        log.warning("Could not answer Telegram callback (%s)", type(exc).__name__)
 
 
 def _count(db, bucket: str | None = None, status: str | None = None) -> int:
@@ -348,8 +348,8 @@ async def _run_search_for_chat(chat_id: int) -> None:
         log.exception("Manual Telegram search failed")
         try:
             await _send(chat_id, f"Не удалось завершить поиск: {type(exc).__name__}: {str(exc)[:400]}", MAIN_MENU)
-        except Exception:
-            log.exception("Could not send search failure message to Telegram")
+        except Exception as exc:
+            log.warning("Could not send search failure message to Telegram (%s)", type(exc).__name__)
     finally:
         # Clear only our own task reference; do not erase a newer search task.
         current = asyncio.current_task()
@@ -420,8 +420,8 @@ async def _handle_callback(update: dict[str, Any]) -> None:
             finally:
                 db.close()
     except Exception as exc:
-        log.exception("Telegram callback failed")
-        await _answer_callback(callback_id, f"Ошибка: {str(exc)[:150]}", True)
+        log.warning("Telegram callback failed (%s)", type(exc).__name__)
+        await _answer_callback(callback_id, f"Ошибка обработки действия: {type(exc).__name__}", True)
 
 
 async def _poll() -> None:
@@ -444,12 +444,20 @@ async def _poll() -> None:
                         await _handle_message(update)
                     elif "callback_query" in update:
                         await _handle_callback(update)
-                except Exception:
-                    log.exception("Failed to process Telegram update %s", update.get("update_id"))
+                except Exception as exc:
+                    log.warning("Failed to process Telegram update %s (%s)", update.get("update_id"), type(exc).__name__)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("Telegram polling error; retrying in 5 seconds")
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status == 409:
+                log.error("Telegram polling conflict (HTTP 409): another long-polling process may be active; retrying in 10 seconds")
+                await asyncio.sleep(10)
+            else:
+                log.error("Telegram polling failed (HTTP %s); retrying in 5 seconds", status)
+                await asyncio.sleep(5)
+        except Exception as exc:
+            log.error("Telegram polling error (%s); retrying in 5 seconds", type(exc).__name__)
             await asyncio.sleep(5)
 
 
@@ -482,11 +490,11 @@ async def start_telegram_bot(search_fn: SearchCallable) -> asyncio.Task | None:
         _poll_task = asyncio.create_task(_poll(), name="telegram-long-polling")
         log.info("Telegram long polling started")
         return _poll_task
-    except Exception:
+    except Exception as exc:
         await _client.aclose()
         _client = None
         _stop_event = None
-        log.exception("Telegram bot could not start")
+        log.error("Telegram bot could not start (%s)", type(exc).__name__)
         return None
 
 
