@@ -25,6 +25,9 @@ from database import AppSetting, SearchRun, SessionLocal, Vacancy
 from scoring import build_cover_letter, salary_decision, score_vacancy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# HTTPX logs full Telegram Bot API URLs, which contain the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("job-agent")
 scheduled_task: asyncio.Task | None = None
 
@@ -67,7 +70,7 @@ async def send_telegram(text: str) -> None:
         try:
             await client.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
         except Exception as exc:
-            log.warning("Telegram notification failed: %s", exc)
+            log.warning("Telegram notification failed (%s)", type(exc).__name__)
 
 
 def setting_value(db: Session, key: str, default: str) -> str:
