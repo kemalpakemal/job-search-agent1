@@ -1,0 +1,34 @@
+name: Inspect bot queue implementation
+on:
+  push:
+    paths:
+      - ".github/workflows/inspect-bot-queue.yml"
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract only bot and model files
+        run: |
+          python - <<'PY'
+          import zipfile
+          wanted = {"telegram_bot.py", "database.py"}
+          with zipfile.ZipFile("source.zip") as z:
+              for name in z.namelist():
+                  if name.rsplit("/", 1)[-1] in wanted:
+                      target = "source_inspection/" + name.rsplit("/", 1)[-1]
+                      import os
+                      os.makedirs("source_inspection", exist_ok=True)
+                      with z.open(name) as src, open(target, "wb") as dst:
+                          dst.write(src.read())
+                      print(target)
+          PY
+      - name: Commit inspection copies
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add source_inspection
+          git commit -m "Temporary inspection of bot queue and database schema" || exit 0
+          git push
