@@ -67,8 +67,8 @@ def _rss_fields(node: ET.Element) -> dict[str, str]:
 
 def _rss_labeled_value(text: str, labels: tuple[str, ...]) -> str:
     names = "|".join(re.escape(label) for label in labels)
-    match = re.search(rf"(?im)(?:^|\\n)\\s*(?:{names})\\s*[:—-]\\s*([^\\n]+)", text)
-    return match.group(1).strip(" \\t.;") if match else ""
+    match = re.search(rf"(?im)(?:^|\n)\s*(?:{names})\s*[:—-]\s*([^\n]+)", text)
+    return match.group(1).strip(" \t.;") if match else ""
 
 
 def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, float | None, str | None, str]:
@@ -77,9 +77,9 @@ def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, flo
              if any(token in line.lower() for token in ("зарплат", "оплат", "доход", "₽", "руб"))]
     candidate = " ".join(lines)
     pattern = (
-        r"(?i)(?:от\\s*)?(\\d[\\d\\s\\u00a0\\u202f]{2,})"
-        r"(?:\\s*(?:[-–—]|до)\\s*(\\d[\\d\\s\\u00a0\\u202f]{2,}))?"
-        r"\\s*(?:₽|руб(?:\\.|лей|ля|ль)?)"
+        r"(?i)(?:от\s*)?(\d[\d\s\u00a0\u202f]{2,})"
+        r"(?:\s*(?:[-–—]|до)\s*(\d[\d\s\u00a0\u202f]{2,}))?"
+        r"\s*(?:₽|руб(?:\.|лей|ля|ль)?)"
     )
     match = re.search(pattern, candidate)
     if not match:
@@ -87,7 +87,7 @@ def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, flo
     def to_number(value: str | None) -> float | None:
         if not value:
             return None
-        digits = re.sub(r"\\D", "", value)
+        digits = re.sub(r"\D", "", value)
         return float(digits) if digits else None
     low, high = to_number(match.group(1)), to_number(match.group(2))
     return low, high, "RUB", classify_salary_type(candidate)
@@ -106,7 +106,7 @@ def _parse_hh_rss(xml_content: bytes, area_name: str = "Сочи") -> list[dict[
         description = fields.get("description") or fields.get("summary") or fields.get("content") or ""
         if not title or not url:
             continue
-        id_match = re.search(r"/vacancy/(\\d+)", url)
+        id_match = re.search(r"/vacancy/(\d+)", url)
         external_id = id_match.group(1) if id_match else (fields.get("guid") or url)
         if external_id in seen:
             continue
