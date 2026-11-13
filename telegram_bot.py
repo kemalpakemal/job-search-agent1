@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -41,7 +42,11 @@ def _api_url(method: str) -> str:
 
 def _allowed_ids() -> set[int]:
     values: set[int] = set()
-    for part in settings.telegram_allowed_user_ids.split(","):
+    configured_ids = ",".join((
+        settings.telegram_allowed_user_ids,
+        os.getenv("TELEGRAM_EXTRA_ALLOWED_USER_IDS", ""),
+    ))
+    for part in configured_ids.split(","):
         part = part.strip()
         if part.lstrip("-").isdigit():
             values.add(int(part))
