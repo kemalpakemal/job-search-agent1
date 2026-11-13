@@ -96,8 +96,11 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     excluded_general = any(term in title for term in GENERAL_ACCOUNTING_EXCLUSIONS)
 
     if title_is_payroll:
-        score += 40
-        reasons.append("Название должности прямо соответствует расчёту заработной платы")
+        # The RSS feed may contain only a short snippet rather than full vacancy duties.
+        # An exact payroll-accounting title is strong evidence of candidate-role fit;
+        # salary and 5/2 schedule are still checked independently before qualification.
+        score += 76
+        reasons.append("Название должности прямо соответствует специализации кандидата — расчёт заработной платы")
     elif "бухгалтер" in title or "специалист" in title:
         score += 5
         reasons.append("Название связано с бухгалтерией, но зарплатная специализация не подтверждена")
