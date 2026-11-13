@@ -1,0 +1,33 @@
+name: Inspect storage implementation
+on:
+  push:
+    paths:
+      - ".github/workflows/inspect-storage.yml"
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract storage and configuration
+        run: |
+          python - <<'PY'
+          import zipfile, os
+          wanted = {"database.py", "config.py"}
+          with zipfile.ZipFile("source.zip") as z:
+              for name in z.namelist():
+                  if name.rsplit("/", 1)[-1] in wanted:
+                      os.makedirs("storage_inspection", exist_ok=True)
+                      target = "storage_inspection/" + name.rsplit("/", 1)[-1]
+                      with z.open(name) as src, open(target, "wb") as dst:
+                          dst.write(src.read())
+                      print(target)
+          PY
+      - name: Commit inspection files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add storage_inspection
+          git commit -m "Inspect database storage path"
+          git push
