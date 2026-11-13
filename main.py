@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, or_
 from sqlalchemy.orm import Session
 
 from config import PROFILE, settings
@@ -88,7 +88,13 @@ def rescore_existing_review_vacancies() -> dict[str, int]:
     try:
         threshold = int(setting_value(db, "min_net_salary", str(settings.min_net_salary)))
         rows = db.scalars(
-            select(Vacancy).where(Vacancy.bucket == "review", Vacancy.user_status == "new")
+            select(Vacancy).where(
+                Vacancy.bucket == "review",
+                or_(
+                    Vacancy.user_status.is_(None),
+                    ~Vacancy.user_status.in_(["rejected", "saved", "applied-manually", "interview"]),
+                ),
+            )
         ).all()
         for job in rows:
             raw = {
