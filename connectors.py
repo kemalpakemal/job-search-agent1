@@ -40,6 +40,17 @@ PAYROLL_SEARCH_TERMS = (
 )
 
 
+def _bounded_page_count(total: Any, page_size: int, max_pages: int) -> int:
+    """Convert a source's reported total into a safe, bounded page count."""
+    try:
+        count = int(total)
+    except (TypeError, ValueError):
+        return 1
+    if count <= 0:
+        return 1
+    return max(1, min(max_pages, (count + page_size - 1) // page_size))
+
+
 def _money(value: Any) -> float | None:
     try:
         if value is None or value == "":
@@ -751,20 +762,50 @@ class VacancyConnectors:
             raise RuntimeError("Не удалось однозначно определить город Сочи в справочнике SuperJob")
 
         semaphore = asyncio.Semaphore(3)
+        try:
+            max_pages = max(1, min(5, int(os.getenv("SUPERJOB_MAX_PAGES", "3"))))
+        except ValueError:
+            max_pages = 3
 
         async def fetch_term(term: str) -> list[dict[str, Any]]:
+            gathered: list[dict[str, Any]] = []
+            page_size = 100
             async with semaphore:
-                data = await self._get_json(
+                first = await self._get_json(
                     "https://api.superjob.ru/2.0/vacancies/",
                     params={
                         "keyword": term,
                         "town": self._sj_town,
-                        "count": 30,
+                        "count": page_size,
                         "page": 0,
                     },
                     headers=headers,
                 )
-            return data.get("objects", []) if isinstance(data, dict) else []
+            if not isinstance(first, dict):
+                return gathered
+            gathered.extend(first.get("objects", []) or [])
+            pages = _bounded_page_count(first.get("total"), page_size, max_pages)
+            if first.get("more") is False:
+                pages = 1
+            for page in range(1, pages):
+                async with semaphore:
+                    data = await self._get_json(
+                        "https://api.superjob.ru/2.0/vacancies/",
+                        params={
+                            "keyword": term,
+                            "town": self._sj_town,
+                            "count": page_size,
+                            "page": page,
+                        },
+                        headers=headers,
+                    )
+                if not isinstance(data, dict):
+                    break
+                rows = data.get("objects", []) or []
+                gathered.extend(rows)
+                if not rows or data.get("more") is False:
+                    break
+            return gathered
 
         query_results = await asyncio.gather(
             *(fetch_term(term) for term in PAYROLL_SEARCH_TERMS),
@@ -814,6 +855,7 @@ class VacancyConnectors:
 
         note = (
             f"Официальный API SuperJob: профильных запросов — {len(PAYROLL_SEARCH_TERMS)}, "
+            f"глубина — до {max_pages} страниц по 100 объявлений на запрос, "
             f"уникальных карточек — {len(unique)}."
         )
         if failed_queries:
@@ -1028,14 +1070,78 @@ class VacancyConnectors:
         )
 
     async def trudvsem(self) -> tuple[list[dict[str, Any]], str]:
-        gathered: list[dict[str, Any]] = []
+        """Search the official open-data API of the Russian Federal Labour Service."""
         base = "https://opendata.trudvsem.ru/api/v1/vacancies/region/" + quote_plus(settings.target_region_code)
-        for term in PAYROLL_SEARCH_TERMS:
-            data = await self._get_json(base, params={"text": term, "limit": 100, "offset": 0})
-            results = data.get("results", {})
-            items = results.get("vacancies", []) if isinstance(results, dict) else []
-            for wrapper in items:
+        semaphore = asyncio.Semaphore(3)
+        page_size = 100
+        max_pages = 4
+
+        async def fetch_term(term: str) -> tuple[list[dict[str, Any]], int]:
+            term_rows: list[dict[str, Any]] = []
+            pages_read = 0
+            offset = 0
+            async with semaphore:
+                first = await self._get_json(
+                    base,
+                    params={"text": term, "limit": page_size, "offset": offset},
+                )
+            pages_read += 1
+            first_results = first.get("results", {}) if isinstance(first, dict) else {}
+            first_rows = first_results.get("vacancies", []) if isinstance(first_results, dict) else []
+            term_rows.extend(first_rows if isinstance(first_rows, list) else [])
+            meta = first.get("meta", {}) if isinstance(first, dict) else {}
+            total_pages = _bounded_page_count(
+                meta.get("total") if isinstance(meta, dict) else None,
+                page_size,
+                max_pages,
+            )
+            for _ in range(1, total_pages):
+                if len(first_rows) < page_size:
+                    break
+                offset += page_size
+                async with semaphore:
+                    data = await self._get_json(
+                        base,
+                        params={"text": term, "limit": page_size, "offset": offset},
+                    )
+                pages_read += 1
+                results = data.get("results", {}) if isinstance(data, dict) else {}
+                rows = results.get("vacancies", []) if isinstance(results, dict) else []
+                if not isinstance(rows, list) or not rows:
+                    break
+                term_rows.extend(rows)
+                if len(rows) < page_size:
+                    break
+            return term_rows, pages_read
+
+        term_results = await asyncio.gather(
+            *(fetch_term(term) for term in PAYROLL_SEARCH_TERMS),
+            return_exceptions=True,
+        )
+        gathered: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        pages_loaded = 0
+        failed_queries = 0
+
+        for result in term_results:
+            if isinstance(result, BaseException):
+                failed_queries += 1
+                continue
+            rows, pages_read = result
+            pages_loaded += pages_read
+            for wrapper in rows:
                 item = wrapper.get("vacancy", wrapper) if isinstance(wrapper, dict) else {}
+                if not isinstance(item, dict):
+                    continue
+                external_id = str(
+                    item.get("id") or item.get("vacancy_id") or item.get("source_id") or ""
+                ).strip()
+                dedupe_id = external_id or str(item.get("vac_url") or item.get("url") or item.get("job-name") or "")
+                if dedupe_id and dedupe_id in seen_ids:
+                    continue
+                if dedupe_id:
+                    seen_ids.add(dedupe_id)
+
                 address_obj = item.get("addresses") or {}
                 address_items = address_obj.get("address", []) if isinstance(address_obj, dict) else []
                 address_locations = []
@@ -1043,37 +1149,60 @@ class VacancyConnectors:
                     for addr in address_items:
                         if isinstance(addr, dict) and addr.get("location"):
                             address_locations.append(str(addr.get("location")))
+
                 region_obj = item.get("region") or ""
                 region_name = region_obj.get("name", "") if isinstance(region_obj, dict) else str(region_obj)
                 city_raw = item.get("town") or item.get("city") or ""
                 if isinstance(city_raw, dict):
                     city_raw = city_raw.get("name") or city_raw.get("title") or city_raw.get("text") or ""
-                city_text = " ".join([str(safe) for safe in [city_raw, *address_locations, region_name] if safe])
-                description = _compact_description(item.get("requirement"), item.get("duty"), item.get("job-name") or item.get("profession"))
+                city_text = " ".join(
+                    str(value) for value in [city_raw, *address_locations, region_name] if value
+                )
+                description = _compact_description(
+                    item.get("requirement"), item.get("duty"),
+                    item.get("job-name") or item.get("profession")
+                )
                 salary_raw = item.get("salary")
                 if isinstance(salary_raw, dict):
-                    s_min = _money(salary_raw.get("from") or salary_raw.get("min"))
-                    s_max = _money(salary_raw.get("to") or salary_raw.get("max"))
+                    salary_min = _money(salary_raw.get("from") or salary_raw.get("min"))
+                    salary_max = _money(salary_raw.get("to") or salary_raw.get("max"))
                 else:
-                    s_min = _money(item.get("salary_min") or salary_raw)
-                    s_max = _money(item.get("salary_max"))
+                    salary_min = _money(item.get("salary_min") or salary_raw)
+                    salary_max = _money(item.get("salary_max"))
                 city = item.get("town") or item.get("city") or city_text
                 gathered.append({
-                    "source": "Работа России", "external_id": str(item.get("id") or item.get("vacancy_id") or item.get("source_id") or ""),
+                    "source": "Работа России",
+                    "external_id": external_id,
                     "title": item.get("job-name") or item.get("profession") or item.get("vacancy_name") or item.get("position") or "",
-                    "employer": item.get("company", {}).get("name", "Работодатель не указан") if isinstance(item.get("company"), dict) else (item.get("company") or "Работодатель не указан"),
-                    "city": city_text, "description": description,
-                    "salary_min": s_min, "salary_max": s_max, "currency": "RUB",
-                    "salary_type": classify_salary_type(description + " " + str(item.get("salary_comment", ""))),
+                    "employer": item.get("company", {}).get("name", "Работодатель не указан")
+                        if isinstance(item.get("company"), dict)
+                        else (item.get("company") or "Работодатель не указан"),
+                    "city": city_text,
+                    "description": description,
+                    "salary_min": salary_min,
+                    "salary_max": salary_max,
+                    "currency": "RUB",
+                    "salary_type": classify_salary_type(
+                        description + " " + str(item.get("salary_comment", ""))
+                    ),
                     "schedule": item.get("schedule") or item.get("schedule_name") or "",
                     "experience": item.get("experience") or item.get("experience_name") or "",
                     "published_at": item.get("date_pub") or item.get("date_update"),
                     "url": item.get("vac_url") or item.get("url") or "https://trudvsem.ru/",
                 })
-            await asyncio.sleep(0.15)
-        # Public API is regional; retain only records explicitly identifying Sochi in city/address fields.
-        gathered = [x for x in gathered if "сочи" in str(x.get("city", "")).lower()]
-        return gathered, "Открытый региональный API Роструда; выдача Краснодарского края дополнительно отфильтрована по Сочи"
+
+        # The official API is region-wide, so keep only records whose town/address
+        # explicitly identifies Sochi. Do not treat the whole Krasnodar region as Sochi.
+        gathered = [item for item in gathered if "сочи" in str(item.get("city", "")).lower()]
+        note = (
+            "Открытый региональный API Роструда; "
+            f"запросов — {len(PAYROLL_SEARCH_TERMS)}, страниц получено — {pages_loaded}, "
+            f"уникальных карточек до фильтра города — {len(seen_ids)}; "
+            "выдача Краснодарского края отфильтрована по Сочи."
+        )
+        if failed_queries:
+            note += f" Ошибок поисковых запросов — {failed_queries}."
+        return gathered, note
 
     async def run_all(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
         """Run all supported APIs independently; a failed source must not block others."""
