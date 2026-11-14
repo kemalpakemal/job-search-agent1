@@ -29,6 +29,11 @@ PAYROLL_SEARCH_TERMS = (
     "специалист по оплате труда",
     "расчетная группа заработная плата",
     "бухгалтер по зарплате 1С БГУ",
+    "помощник бухгалтера по расчету заработной платы",
+    "бухгалтер по расчету зарплаты без опыта",
+    "бухгалтер расчетчик обучение",
+    "расчетчик заработной платы обучение",
+    "бухгалтер по зарплате обучим",
 )
 
 
@@ -283,6 +288,7 @@ class VacancyConnectors:
                 params={
                     "query": term,
                     "location": location_id,
+                    "business_area": 10181,
                     "per_page": 100,
                     "page": 1,
                     "fields": "title,description,url,salary,start_time,update_time,is_active",
