@@ -48,6 +48,22 @@ def _money(value: Any) -> float | None:
         return None
 
 
+def _structured_text(value: Any) -> str:
+    """Normalize text-like values that may be strings or API dictionary objects."""
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("title", "name", "value", "text", "label"):
+            if value.get(key) not in (None, ""):
+                return _structured_text(value[key])
+        return " ".join(
+            part for part in (_structured_text(v) for v in value.values()) if part
+        )
+    if isinstance(value, list):
+        return ", ".join(part for part in (_structured_text(v) for v in value) if part)
+    return str(value).strip()
+
+
 def _compact_description(requirement: Any, responsibility: Any, full: Any = None) -> str:
     vals: list[str] = []
     def flatten(value: Any) -> None:
@@ -606,14 +622,34 @@ class VacancyConnectors:
                     profession = str(row.get("profession") or "").strip()
                     company = str(row.get("companyName") or "Работодатель не указан").strip()
                     category = str(row.get("businessArea") or business_area_name).strip()
+
+                    # Search cards can be sparse. When Avito does include structured fields,
+                    # retain them instead of discarding usable details; never fabricate missing data.
+                    params_obj = row.get("params") or {}
+                    if not isinstance(params_obj, dict):
+                        params_obj = {}
+                    salary_obj = params_obj.get("salary") or row.get("salary") or {}
+                    if not isinstance(salary_obj, dict):
+                        salary_obj = {}
+                    salary_min = _money(salary_obj.get("from") or salary_obj.get("min") or row.get("salary_from"))
+                    salary_max = _money(salary_obj.get("to") or salary_obj.get("max") or row.get("salary_to"))
+                    currency = salary_obj.get("currency") or row.get("currency")
+                    schedule = _structured_text(params_obj.get("schedule") or row.get("schedule"))
+                    experience = _structured_text(params_obj.get("experience") or row.get("experience"))
+                    detail_description = _structured_text(
+                        row.get("description") or row.get("text") or row.get("vacancyDescription")
+                    )
                     description_parts = [
+                        detail_description,
                         f"Профессия по классификатору Авито: {profession}" if profession else "",
                         f"Сфера Авито: {category}",
                         f"Адрес: {address}" if address else "",
-                        "Внимание: поиск-метод Авито возвращает краткую карточку (название, работодатель, город и ссылку), "
-                        "но не полное описание обязанностей, зарплату, график и требуемый опыт. "
-                        "Эти условия необходимо проверить на странице вакансии.",
                     ]
+                    if not detail_description:
+                        description_parts.append(
+                            "Внимание: поисковая карточка Авито не содержит полного описания обязанностей. "
+                            "Проверьте условия, зарплату, график и стаж на странице вакансии."
+                        )
                     gathered.append({
                         "source": "Авито Работа",
                         "external_id": external_id,
@@ -621,13 +657,13 @@ class VacancyConnectors:
                         "employer": company,
                         "city": city,
                         "description": "\n".join(part for part in description_parts if part)[:12000],
-                        "salary_min": None,
-                        "salary_max": None,
-                        "currency": None,
-                        "salary_type": "unknown",
-                        "schedule": "",
-                        "experience": "",
-                        "published_at": None,
+                        "salary_min": salary_min,
+                        "salary_max": salary_max,
+                        "currency": currency,
+                        "salary_type": classify_salary_type(detail_description),
+                        "schedule": schedule,
+                        "experience": experience,
+                        "published_at": row.get("createdAt") or row.get("publishedAt") or row.get("created"),
                         "url": link,
                     })
                     category_count += 1
