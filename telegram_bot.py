@@ -208,6 +208,11 @@ def _job_keyboard(job: Vacancy, bucket: str) -> dict[str, Any]:
     return {"inline_keyboard": rows}
 
 
+def _is_browsable_vacancy(job: Vacancy) -> bool:
+    """Only profile-relevant vacancies may enter New or Viewed queues."""
+    return job.bucket in {"qualified", "review"}
+
+
 def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | None:
     """Return the next card from the new, viewed or favorites queue."""
     stmt = select(Vacancy).order_by(desc(Vacancy.id))
@@ -230,7 +235,7 @@ def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | No
         # Never show vacancies rejected by the profile/salary/location filters.
         # A rejected vacancy can remain in the database for diagnostics, but it
         # must not leak into the user's New or Viewed queues.
-        if job.bucket not in {"qualified", "review"}:
+        if not _is_browsable_vacancy(job):
             continue
         # "Пропустить" hides a vacancy from both browsing queues.
         if job.user_status == "rejected":
