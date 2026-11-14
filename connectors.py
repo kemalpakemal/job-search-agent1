@@ -267,7 +267,7 @@ def _parse_email_alert_html(
     parser = _EmailAlertHTMLParser()
     parser.feed(html_body or "")
     visible_text = "".join(parser.text_parts)
-    visible_text = html_unescape(re.sub(r"\n{3,}", "\\n\\n", visible_text))
+    visible_text = html_unescape(re.sub(r"\n{3,}", "\n\n", visible_text))
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
