@@ -186,6 +186,145 @@ def _parse_hh_rss(xml_content: bytes, area_name: str = "Сочи") -> list[dict[
         })
     return result
 
+def _parse_hh_initial_state(page: bytes | str) -> dict[str, Any]:
+    """Read HeadHunter's server-rendered public page JSON state."""
+    if isinstance(page, bytes):
+        page_text = page.decode("utf-8", errors="replace")
+    else:
+        page_text = page
+    match = re.search(
+        r'<template[^>]*id=["\\']HH-Lux-InitialState["\\'][^>]*>(.*?)</template>',
+        page_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError("В HTML HeadHunter не найден HH-Lux-InitialState")
+    try:
+        state = json.loads(html_unescape(match.group(1)))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Не удалось разобрать JSON HH-Lux-InitialState") from exc
+    if not isinstance(state, dict):
+        raise RuntimeError("HeadHunter вернул неизвестную структуру начального состояния")
+    return state
+
+
+def _hh_display(value: Any) -> str:
+    """Extract a human-readable label from HH dictionaries/lists without leaking IDs."""
+    if isinstance(value, dict):
+        for key in ("visibleName", "name", "title", "label", "text", "value"):
+            if value.get(key) not in (None, ""):
+                return _hh_display(value[key])
+        return ""
+    if isinstance(value, list):
+        return ", ".join(part for part in (_hh_display(v) for v in value) if part)
+    return str(value).strip() if value is not None else ""
+
+
+def _hh_experience(value: Any) -> str:
+    label = _hh_display(value)
+    if label:
+        return label
+    code = str(value.get("id") or "") if isinstance(value, dict) else str(value or "")
+    return {
+        "noExperience": "Без опыта",
+        "between1And3": "От 1 года до 3 лет",
+        "between3And6": "От 3 до 6 лет",
+        "moreThan6": "Более 6 лет",
+    }.get(code, "")
+
+
+def _hh_schedule(payload: dict[str, Any]) -> str:
+    """Prefer a day pattern (5/2 etc.); otherwise retain HH's work-format label."""
+    day_value = (
+        payload.get("workScheduleByDays")
+        or payload.get("workingDays")
+        or payload.get("scheduleByDays")
+    )
+    day_text = _hh_display(day_value)
+    day_codes = {
+        "FIVE_ON_TWO_OFF": "5/2",
+        "SIX_ON_ONE_OFF": "6/1",
+        "TWO_ON_TWO_OFF": "2/2",
+        "THREE_ON_THREE_OFF": "3/3",
+        "FOUR_ON_TWO_OFF": "4/2",
+    }
+    raw_codes: list[str] = []
+    def collect_codes(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in ("id", "code", "value"):
+                if value.get(key):
+                    raw_codes.append(str(value[key]).upper())
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    collect_codes(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect_codes(nested)
+        elif isinstance(value, str):
+            raw_codes.append(value.upper())
+    collect_codes(day_value)
+    for code in raw_codes:
+        if code in day_codes:
+            return day_codes[code]
+    match = re.search(r"(?<!\\d)([23456]\\s*/\\s*[123456])(?!\\d)", day_text)
+    if match:
+        return re.sub(r"\\s*", "", match.group(1))
+
+    schedule_value = payload.get("workSchedule") or payload.get("schedule")
+    schedule_text = _hh_display(schedule_value)
+    if not schedule_text and isinstance(schedule_value, str):
+        schedule_text = {
+            "FULL_DAY": "Полный день",
+            "SHIFT": "Сменный график",
+            "FLEXIBLE": "Гибкий график",
+            "REMOTE": "Удалённая работа",
+            "FLY_IN_FLY_OUT": "Вахтовый метод",
+        }.get(schedule_value.upper(), schedule_value)
+    return schedule_text
+
+
+def _hh_search_item_to_vacancy(item: dict[str, Any], area_name: str) -> dict[str, Any]:
+    """Normalize one HH-Lux search-result object into the shared vacancy schema."""
+    vacancy_id = str(item.get("vacancyId") or item.get("id") or "").strip()
+    company = item.get("company") or item.get("employer") or {}
+    area = item.get("area") or {}
+    compensation = item.get("compensation") or item.get("salary") or {}
+    snippet = item.get("snippet") or {}
+    description = _compact_description(
+        snippet.get("req") or snippet.get("requirement"),
+        snippet.get("resp") or snippet.get("responsibility"),
+        snippet.get("cond") or snippet.get("conditions"),
+    )
+    salary_type = classify_salary_type(
+        description,
+        explicit_gross=compensation.get("gross") if isinstance(compensation.get("gross"), bool) else None,
+    )
+    publication = item.get("publicationTime") or item.get("publishedAt") or item.get("published_at")
+    if isinstance(publication, dict):
+        publication = publication.get("date") or publication.get("text") or publication.get("value") or ""
+    links = item.get("links") or {}
+    schedule = _hh_schedule(item)
+    experience = _hh_experience(item.get("experience"))
+    currency = compensation.get("currencyCode") or compensation.get("currency") or "RUR"
+    return {
+        "source": "HeadHunter",
+        "external_id": vacancy_id,
+        "title": str(item.get("name") or item.get("title") or "").strip(),
+        "employer": _hh_display(company) or "Работодатель не указан",
+        "city": _hh_display(area) or area_name,
+        "description": description[:12000],
+        "salary_min": _money(compensation.get("from")),
+        "salary_max": _money(compensation.get("to")),
+        "currency": currency,
+        "salary_type": salary_type,
+        "schedule": schedule,
+        "experience": experience,
+        "published_at": str(publication or ""),
+        "url": links.get("desktop") or links.get("mobile") or item.get("url")
+            or (f"https://hh.ru/vacancy/{vacancy_id}" if vacancy_id else ""),
+    }
+
+
 def _hh_area_id(data: list[dict[str, Any]], wanted: str = "сочи") -> str | None:
     found: list[str] = []
     def walk(node: Any, parent_names: list[str]) -> None:
@@ -274,11 +413,12 @@ class VacancyConnectors:
 
 
     async def hh(self) -> tuple[list[dict[str, Any]], str]:
-        """Search HeadHunter through its public vacancy RSS feeds.
+        """Search HeadHunter public server-rendered pages and enrich matching vacancies.
 
-        The anonymous JSON vacancy endpoint now stops automated clients with a
-        captcha/403 flow. RSS is a public search representation and does not
-        require an applicant OAuth app or a stored HH password.
+        The applicant-facing JSON API can return 403. The public search page still
+        exposes structured vacancy cards in HH-Lux-InitialState, including salary,
+        employer and experience. Full descriptions are available on the public
+        vacancy page's vacancyView object.
         """
         if not settings.hh_user_agent or "set-contact-email-in-env" in settings.hh_user_agent.lower():
             raise RuntimeError(
@@ -287,7 +427,8 @@ class VacancyConnectors:
             )
         headers = {
             "User-Agent": settings.hh_user_agent,
-            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.7",
         }
         if not self._hh_area:
             areas = await self._get_json(
@@ -298,8 +439,6 @@ class VacancyConnectors:
             if not self._hh_area:
                 raise RuntimeError("В справочнике HeadHunter не найден город Сочи в Краснодарском крае")
 
-        # Keep queries narrow and focused on payroll accounting. A small concurrency
-        # limit avoids sending a burst of requests to the public RSS endpoint.
         hh_terms = (
             "бухгалтер по расчету заработной платы",
             "бухгалтер по зарплате",
@@ -313,62 +452,198 @@ class VacancyConnectors:
             "бухгалтер расчетчик обучение",
             "помощник бухгалтера по расчету заработной платы",
         )
-        semaphore = asyncio.Semaphore(2)
+        search_semaphore = asyncio.Semaphore(2)
 
         async def fetch_term(term: str) -> list[dict[str, Any]]:
-            async with semaphore:
+            async with search_semaphore:
                 params = {
                     "text": term,
                     "area": self._hh_area,
                     "enable_snippets": "true",
+                    "clusters": "true",
+                    "ored_clusters": "true",
+                    "page": 0,
+                    "per_page": 50,
                 }
                 response = await self.client.get(
-                    "https://hh.ru/search/vacancy/rss",
+                    "https://hh.ru/search/vacancy",
                     params=params,
                     headers=headers,
                 )
                 if response.status_code in (429, 500, 502, 503, 504):
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(2)
                     response = await self.client.get(
-                        "https://hh.ru/search/vacancy/rss",
+                        "https://hh.ru/search/vacancy",
                         params=params,
                         headers=headers,
                     )
                 response.raise_for_status()
-                return _parse_hh_rss(response.content, area_name=settings.target_city)
+                state = _parse_hh_initial_state(response.content)
+                result = state.get("vacancySearchResult") or {}
+                rows = result.get("vacancies") or []
+                if not isinstance(rows, list):
+                    raise RuntimeError("HH-Lux-InitialState не содержит список вакансий")
+                normalized: list[dict[str, Any]] = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    vacancy = _hh_search_item_to_vacancy(row, settings.target_city)
+                    if vacancy["external_id"] and vacancy["title"]:
+                        normalized.append(vacancy)
+                return normalized
 
-        query_results = await asyncio.gather(
+        results = await asyncio.gather(
             *(fetch_term(term) for term in hh_terms),
             return_exceptions=True,
         )
         unique: dict[str, dict[str, Any]] = {}
         failures: list[str] = []
         successful_queries = 0
-        for term, result in zip(hh_terms, query_results):
+        for term, result in zip(hh_terms, results):
             if isinstance(result, BaseException):
-                failures.append(
-                    f"{term}: {type(result).__name__}: {str(result)[:140]}"
-                )
+                failures.append(f"{term}: {type(result).__name__}: {str(result)[:180]}")
                 continue
             successful_queries += 1
             for item in result:
-                vacancy_id = str(item.get("external_id") or "").strip()
-                if vacancy_id and vacancy_id not in unique:
-                    unique[vacancy_id] = item
+                unique.setdefault(item["external_id"], item)
 
+        # If the HTML state changes or HH blocks the page, retain the known RSS
+        # route as a transparent fallback rather than disabling the whole source.
         if successful_queries == 0:
-            details = " | ".join(failures[:3])
-            raise RuntimeError(
-                f"Все {len(hh_terms)} RSS-запросов HeadHunter завершились ошибкой. {details}"
+            rss_headers = {
+                "User-Agent": settings.hh_user_agent,
+                "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+            }
+            rss_results = await asyncio.gather(
+                *(
+                    self.client.get(
+                        "https://hh.ru/search/vacancy/rss",
+                        params={"text": term, "area": self._hh_area, "enable_snippets": "true"},
+                        headers=rss_headers,
+                    )
+                    for term in hh_terms
+                ),
+                return_exceptions=True,
             )
+            rss_ok = 0
+            for result in rss_results:
+                if isinstance(result, BaseException):
+                    continue
+                try:
+                    result.raise_for_status()
+                    rss_ok += 1
+                    for item in _parse_hh_rss(result.content, area_name=settings.target_city):
+                        unique.setdefault(item["external_id"], item)
+                except Exception:
+                    continue
+            if rss_ok == 0:
+                details = " | ".join(failures[:3])
+                raise RuntimeError(
+                    f"Не удалось получить выдачу HeadHunter через HTML и RSS. {details}"
+                )
+            search_mode = f"RSS fallback: {rss_ok}/{len(hh_terms)}"
+        else:
+            search_mode = f"HTML HH-Lux-InitialState: {successful_queries}/{len(hh_terms)}"
+
+        # The search state already carries structured salary/experience/company
+        # fields. Fetch the full vacancy page only for payroll-title matches to
+        # obtain the complete description and any published schedule requirements.
+        candidates = [
+            item for item in unique.values()
+            if is_profile_relevant({"title": item.get("title"), "description": item.get("description")})
+            and re.search(r"/vacancy/(\\d+)", item.get("url", ""))
+        ][:80]
+        detail_semaphore = asyncio.Semaphore(4)
+        detail_failures = 0
+
+        async def enrich_from_page(item: dict[str, Any]) -> dict[str, Any]:
+            nonlocal detail_failures
+            vacancy_id = item["external_id"]
+            try:
+                async with detail_semaphore:
+                    response = await self.client.get(
+                        f"https://hh.ru/vacancy/{vacancy_id}",
+                        headers=headers,
+                    )
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        await asyncio.sleep(1.5)
+                        response = await self.client.get(
+                            f"https://hh.ru/vacancy/{vacancy_id}",
+                            headers=headers,
+                        )
+                    response.raise_for_status()
+                state = _parse_hh_initial_state(response.content)
+                view = state.get("vacancyView") or {}
+                if not isinstance(view, dict):
+                    raise RuntimeError("В карточке HH не найден vacancyView")
+                nested = view.get("vacancy") if isinstance(view.get("vacancy"), dict) else {}
+                detail = {**view, **nested}
+                raw_description = detail.get("description") or view.get("description")
+                description = _rss_plain_text(raw_description or "")
+                skills = detail.get("keySkills") or detail.get("key_skills") or []
+                skill_names = [_hh_display(x) for x in skills]
+                skill_names = [x for x in skill_names if x]
+                if skill_names:
+                    description += "\\nНавыки: " + ", ".join(skill_names)
+                if description:
+                    item["description"] = description[:12000]
+                employer = detail.get("company") or detail.get("employer")
+                if employer:
+                    item["employer"] = _hh_display(employer) or item["employer"]
+                area = detail.get("area")
+                if area:
+                    item["city"] = _hh_display(area) or item["city"]
+                compensation = detail.get("compensation") or detail.get("salary") or {}
+                if isinstance(compensation, dict):
+                    item["salary_min"] = _money(compensation.get("from")) if compensation.get("from") is not None else item["salary_min"]
+                    item["salary_max"] = _money(compensation.get("to")) if compensation.get("to") is not None else item["salary_max"]
+                    item["currency"] = compensation.get("currencyCode") or compensation.get("currency") or item["currency"]
+                    gross = compensation.get("gross")
+                    if isinstance(gross, bool):
+                        item["salary_type"] = "gross" if gross else "net"
+                exp = detail.get("experience")
+                if exp:
+                    item["experience"] = _hh_experience(exp) or item["experience"]
+                schedule = _hh_schedule(detail)
+                if schedule:
+                    item["schedule"] = schedule
+                # Some HH pages expose the day pattern in separate fields rather
+                # than in workSchedule; accept it only when explicitly present.
+                page_text = _rss_plain_text(response.text)
+                if not item.get("schedule") or item.get("schedule") == "Полный день":
+                    match = re.search(
+                        r"(?i)(?:график работы|рабочие дни|режим работы)\\s*[:—-]?\\s*(5\\s*/\\s*2|2\\s*/\\s*2|3\\s*/\\s*3|6\\s*/\\s*1)",
+                        page_text,
+                    )
+                    if match:
+                        item["schedule"] = re.sub(r"\\s*", "", match.group(1))
+                if "зарплата" not in item.get("description", "").lower():
+                    salary_line = ""
+                    if item.get("salary_min") is not None:
+                        salary_line = "Зарплата: от " + str(round(item["salary_min"]))
+                        if item.get("salary_max") is not None:
+                            salary_line += " до " + str(round(item["salary_max"]))
+                        salary_line += " " + str(item.get("currency") or "RUR")
+                        if item.get("salary_type") in {"gross", "net"}:
+                            salary_line += " до вычета НДФЛ" if item["salary_type"] == "gross" else " на руки"
+                    if salary_line:
+                        item["description"] = (item.get("description", "") + "\\n" + salary_line)[:12000]
+            except Exception:
+                detail_failures += 1
+            return item
+
+        if candidates:
+            await asyncio.gather(*(enrich_from_page(item) for item in candidates))
 
         note = (
-            f"Публичная RSS-выдача hh.ru: успешных запросов — {successful_queries}/"
-            f"{len(hh_terms)}, уникальных карточек — {len(unique)}. "
-            "Полные описания API не запрашиваются; используются данные RSS."
+            f"{search_mode}: уникальных карточек — {len(unique)}, "
+            f"полных карточек проверено — {len(candidates)}, "
+            f"полные описания получены — {sum(1 for x in candidates if len(x.get('description', '')) > 500)}."
         )
-        if failures:
-            note += f" Ошибок запросов: {len(failures)}. Пример: {failures[0][:220]}"
+        if detail_failures:
+            note += f" Не удалось обогатить карточек: {detail_failures}."
+        if failures and successful_queries:
+            note += f" Ошибок поисковых запросов: {len(failures)}; пример: {failures[0][:180]}."
         return list(unique.values()), note
 
     async def superjob(self) -> tuple[list[dict[str, Any]], str]:
