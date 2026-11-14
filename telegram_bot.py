@@ -227,6 +227,11 @@ def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | No
     rows = db.scalars(stmt).all()
     legacy_viewed_statuses = {"saved", "applied-manually", "interview"}
     for job in rows:
+        # Never show vacancies rejected by the profile/salary/location filters.
+        # A rejected vacancy can remain in the database for diagnostics, but it
+        # must not leak into the user's New or Viewed queues.
+        if job.bucket not in {"qualified", "review"}:
+            continue
         # "Пропустить" hides a vacancy from both browsing queues.
         if job.user_status == "rejected":
             continue
