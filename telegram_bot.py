@@ -126,10 +126,15 @@ def _format_search_summary(result: dict[str, Any], queue_counts: dict[str, int])
     review = int(result.get("review", 0))
     found = qualified + review
     if not found:
-        return "Поиск завершён.\\nПодходящих вакансий не нашёл."
+        return (
+            "Поиск завершён.\n"
+            "Подходящих вакансий не найдено.\n"
+            f"Новые: {queue_counts['new']} · Просмотренные: {queue_counts['viewed']}."
+        )
     return (
-        "Поиск завершён.\\n"
-        f"Нашёл: {found} вакансий ({qualified} подходят, {review} нужно проверить).\\n"
+        "Поиск завершён.\n"
+        f"Найдено: {found} вакансий\n"
+        f"Подходят: {qualified} · Проверить: {review}\n"
         f"Новые: {queue_counts['new']} · Просмотренные: {queue_counts['viewed']}."
     )
 
