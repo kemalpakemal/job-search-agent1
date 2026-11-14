@@ -13,7 +13,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from config import settings
-from scoring import classify_salary_type
+from scoring import classify_salary_type, is_profile_relevant
 
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
 
@@ -256,6 +256,221 @@ class VacancyConnectors:
         })
         return item
 
+
+    async def hh(self) -> tuple[list[dict[str, Any]], str]:
+        """Search HeadHunter for payroll roles, then enrich relevant cards with full descriptions."""
+        if not settings.hh_user_agent or "set-contact-email-in-env" in settings.hh_user_agent.lower():
+            raise RuntimeError(
+                "HeadHunter не запрашивался: укажи HH_USER_AGENT с названием приложения "
+                "и контактным email."
+            )
+        headers = {"User-Agent": settings.hh_user_agent, "Accept": "application/json"}
+        if not self._hh_area:
+            areas = await self._get_json("https://api.hh.ru/areas", headers=headers)
+            self._hh_area = _hh_area_id(areas)
+            if not self._hh_area:
+                raise RuntimeError("В справочнике HeadHunter не найден город Сочи в Краснодарском крае")
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def fetch_term(term: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                data = await self._get_json(
+                    "https://api.hh.ru/vacancies",
+                    params={
+                        "text": term,
+                        "area": self._hh_area,
+                        "per_page": 30,
+                        "page": 0,
+                        "order_by": "publication_time",
+                    },
+                    headers=headers,
+                )
+            return data.get("items", []) if isinstance(data, dict) else []
+
+        query_results = await asyncio.gather(
+            *(fetch_term(term) for term in PAYROLL_SEARCH_TERMS),
+            return_exceptions=True,
+        )
+        unique: dict[str, dict[str, Any]] = {}
+        failed_queries = 0
+        for result in query_results:
+            if isinstance(result, BaseException):
+                failed_queries += 1
+                continue
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                vacancy_id = str(item.get("id") or "").strip()
+                title = str(item.get("name") or "").strip()
+                if not vacancy_id or not title or vacancy_id in unique:
+                    continue
+                salary = item.get("salary") or {}
+                snippet = item.get("snippet") or {}
+                description = _compact_description(
+                    snippet.get("requirement"),
+                    snippet.get("responsibility"),
+                )
+                unique[vacancy_id] = {
+                    "source": "HeadHunter",
+                    "external_id": vacancy_id,
+                    "title": title,
+                    "employer": (item.get("employer") or {}).get("name", "Работодатель не указан"),
+                    "city": (item.get("area") or {}).get("name", settings.target_city),
+                    "description": description,
+                    "salary_min": _money(salary.get("from")),
+                    "salary_max": _money(salary.get("to")),
+                    "currency": salary.get("currency"),
+                    "salary_type": classify_salary_type(
+                        description,
+                        explicit_gross=salary.get("gross") if isinstance(salary.get("gross"), bool) else None,
+                    ),
+                    "schedule": (item.get("schedule") or {}).get("name", ""),
+                    "experience": (item.get("experience") or {}).get("name", ""),
+                    "published_at": item.get("published_at"),
+                    "url": item.get("alternate_url") or "",
+                }
+
+        if not unique and failed_queries == len(PAYROLL_SEARCH_TERMS):
+            raise RuntimeError("Все поисковые запросы HeadHunter завершились ошибкой")
+
+        # Do not fetch full detail for unrelated titles; the main scoring layer still makes
+        # the final decision using the full description and all candidate-profile rules.
+        candidates = [
+            item for item in unique.values()
+            if is_profile_relevant({"title": item["title"], "description": item["description"]})
+        ]
+        detail_limit = 80
+        to_enrich = candidates[:detail_limit]
+        detail_semaphore = asyncio.Semaphore(4)
+
+        async def enrich_one(item: dict[str, Any]) -> dict[str, Any]:
+            async with detail_semaphore:
+                return await self._enrich_hh(item, headers)
+
+        enriched_results = await asyncio.gather(
+            *(enrich_one(item) for item in to_enrich),
+            return_exceptions=True,
+        )
+        enriched: list[dict[str, Any]] = []
+        for original, result in zip(to_enrich, enriched_results):
+            enriched.append(original if isinstance(result, BaseException) else result)
+
+        enriched_ids = {item["external_id"] for item in to_enrich}
+        # Preserve other search results for transparent rejection/review instead of silently
+        # discarding them; the profile filter in evaluate_vacancy remains authoritative.
+        remaining = [
+            item for item in unique.values()
+            if item["external_id"] not in enriched_ids
+        ]
+        all_rows = enriched + remaining
+        note = (
+            f"Официальный API HeadHunter: профильных запросов — {len(PAYROLL_SEARCH_TERMS)}, "
+            f"уникальных карточек — {len(unique)}, загружено полных описаний — {len(enriched)}."
+        )
+        if failed_queries:
+            note += f" Не удалось выполнить запросов: {failed_queries}."
+        if len(candidates) > detail_limit:
+            note += f" Ещё {len(candidates) - detail_limit} карточек оставлены с краткими данными."
+        return all_rows, note
+
+    async def superjob(self) -> tuple[list[dict[str, Any]], str]:
+        """Search SuperJob using its official API and the configured application key."""
+        app_id = settings.superjob_app_id.strip()
+        if not app_id:
+            return [], "Не подключён: нужен ключ приложения SUPERJOB_APP_ID из кабинета разработчика SuperJob"
+
+        headers = {"X-Api-App-Id": app_id, "Accept": "application/json"}
+        if self._sj_town is None:
+            towns = await self._get_json(
+                "https://api.superjob.ru/2.0/towns/",
+                params={"keyword": settings.target_city, "count": 20},
+                headers=headers,
+            )
+            objects = towns.get("objects", []) if isinstance(towns, dict) else []
+            exact = [
+                row for row in objects
+                if isinstance(row, dict)
+                and str(row.get("title") or "").strip().lower() == settings.target_city.lower()
+            ]
+            chosen = exact[0] if exact else None
+            if chosen and chosen.get("id") is not None:
+                self._sj_town = int(chosen["id"])
+            elif len(objects) == 1 and isinstance(objects[0], dict) and objects[0].get("id") is not None:
+                self._sj_town = int(objects[0]["id"])
+        if self._sj_town is None:
+            raise RuntimeError("Не удалось однозначно определить город Сочи в справочнике SuperJob")
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def fetch_term(term: str) -> list[dict[str, Any]]:
+            async with semaphore:
+                data = await self._get_json(
+                    "https://api.superjob.ru/2.0/vacancies/",
+                    params={
+                        "keyword": term,
+                        "town": self._sj_town,
+                        "count": 30,
+                        "page": 0,
+                    },
+                    headers=headers,
+                )
+            return data.get("objects", []) if isinstance(data, dict) else []
+
+        query_results = await asyncio.gather(
+            *(fetch_term(term) for term in PAYROLL_SEARCH_TERMS),
+            return_exceptions=True,
+        )
+        unique: dict[str, dict[str, Any]] = {}
+        failed_queries = 0
+        for result in query_results:
+            if isinstance(result, BaseException):
+                failed_queries += 1
+                continue
+            for item in result:
+                if not isinstance(item, dict):
+                    continue
+                vacancy_id = str(item.get("id") or "").strip()
+                title = str(item.get("profession") or "").strip()
+                if not vacancy_id or not title or vacancy_id in unique:
+                    continue
+                description = _compact_description(
+                    item.get("candidat"),
+                    item.get("work"),
+                    item.get("vacancyRichText"),
+                )
+                town = item.get("town") or {}
+                work_type = item.get("type_of_work") or {}
+                experience = item.get("experience") or {}
+                unique[vacancy_id] = {
+                    "source": "SuperJob",
+                    "external_id": vacancy_id,
+                    "title": title,
+                    "employer": item.get("firm_name") or "Работодатель не указан",
+                    "city": town.get("title") if isinstance(town, dict) else settings.target_city,
+                    "description": description,
+                    "salary_min": _money(item.get("payment_from")),
+                    "salary_max": _money(item.get("payment_to")),
+                    "currency": item.get("currency") or "rub",
+                    # Do not assume that the API's payment fields are NET or GROSS.
+                    "salary_type": classify_salary_type(description),
+                    "schedule": work_type.get("title", "") if isinstance(work_type, dict) else str(work_type or ""),
+                    "experience": experience.get("title", "") if isinstance(experience, dict) else str(experience or ""),
+                    "published_at": item.get("date_published") or item.get("date_pub"),
+                    "url": item.get("link") or "",
+                }
+
+        if not unique and failed_queries == len(PAYROLL_SEARCH_TERMS):
+            raise RuntimeError("Все поисковые запросы SuperJob завершились ошибкой")
+
+        note = (
+            f"Официальный API SuperJob: профильных запросов — {len(PAYROLL_SEARCH_TERMS)}, "
+            f"уникальных карточек — {len(unique)}."
+        )
+        if failed_queries:
+            note += f" Не удалось выполнить запросов: {failed_queries}."
+        return list(unique.values()), note
+
     async def avito(self) -> tuple[list[dict[str, Any]], str]:
         """Search public Avito Work vacancies using the documented Job API."""
         client_id = os.getenv("AVITO_CLIENT_ID", "").strip()
@@ -486,18 +701,32 @@ class VacancyConnectors:
         return gathered, "Открытый региональный API Роструда; выдача Краснодарского края дополнительно отфильтрована по Сочи"
 
     async def run_all(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Run all supported APIs independently; a failed source must not block others."""
         all_items: list[dict[str, Any]] = []
         statuses: dict[str, str] = {}
-        for name, func in (("HeadHunter", self.hh), ("SuperJob", self.superjob), ("Работа России", self.trudvsem), ("Авито Работа", self.avito)):
+        sources = (
+            ("HeadHunter", self.hh),
+            ("SuperJob", self.superjob),
+            ("Работа России", self.trudvsem),
+            ("Авито Работа", self.avito),
+        )
+
+        async def run_source(name: str, func: Any) -> tuple[str, list[dict[str, Any]], str]:
             try:
                 items, note = await func()
-                all_items.extend(items)
-                statuses[name] = f"Получено {len(items)} вакансий. {note}"
+                return name, items, f"Получено {len(items)} вакансий. {note}"
             except httpx.HTTPStatusError as exc:
-                statuses[name] = f"Ошибка HTTP {exc.response.status_code}: {exc.response.text[:250]}"
+                return name, [], f"Ошибка HTTP {exc.response.status_code}: {exc.response.text[:250]}"
             except Exception as exc:
-                statuses[name] = f"Ошибка подключения/обработки: {type(exc).__name__}: {str(exc)[:250]}"
+                return name, [], f"Ошибка подключения/обработки: {type(exc).__name__}: {str(exc)[:250]}"
+
+        results = await asyncio.gather(
+            *(run_source(name, func) for name, func in sources)
+        )
+        for name, items, status in results:
+            all_items.extend(items)
+            statuses[name] = status
         statuses["Зарплата.ру"] = "Ручной источник: публичный API поиска вакансий для соискателей не подтверждён; скрытый сбор не используется"
-        statuses["Работа.ру"] = "Ручной источник: автоматизация допустима только через официально предоставленный API и в пределах выданных прав"
+        statuses["Работа.ру"] = "Ручной источник: автоматизация допустима только через официальный API и в пределах выданных прав"
         statuses["Сайты работодателей"] = "Ручной источник: можно подключать по отдельности при наличии официального фида/API"
         return all_items, statuses
