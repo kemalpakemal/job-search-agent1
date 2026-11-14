@@ -131,7 +131,7 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
     review_reasons: list[str] = []
     if not city_ok:
         review_reasons.append("Город в вакансии не указан" if city_unknown else "Вакансия указана не в Сочи")
-    if salary_reason:
+    if salary_reason and salary_bucket != "qualified":
         review_reasons.append(salary_reason)
     if schedule_conflict:
         review_reasons.append("Указан график, отличный от требуемого 5/2")
