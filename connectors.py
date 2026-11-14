@@ -222,7 +222,7 @@ def _email_alert_title(anchor_text: str, context: str, url: str) -> str:
         for line in re.split(r"[\r\n]+", context)
     ]
     skip = (
-        "зарплат", "руб", "₽", "на руки", "до вычета", "отклик",
+        "руб", "₽", "на руки", "до вычета", "отклик",
         "подробнее", "посмотреть", "график", "опыт работы", "сочи",
         "присылать вам", "вы получили", "отписаться", "настроить подписку",
     )
@@ -232,7 +232,9 @@ def _email_alert_title(anchor_text: str, context: str, url: str) -> str:
             continue
         if any(word in low for word in skip):
             continue
-        if re.fullmatch(r"[\\d\\s.,:/–—-]+", line):
+        if re.search(r"(?i)\d[\d \u00a0]*\s*(?:₽|руб)", line):
+            continue
+        if re.fullmatch(r"[\d\s.,:/–—-]+", line):
             continue
         return line
 
