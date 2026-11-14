@@ -218,9 +218,10 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     if "1с:бгу" in text or "1с бгу" in text:
         score += 7
         reasons.append("Совпадает используемая кандидатом система 1С:БГУ")
+    elif any(term in text for term in ("1с:згу", "1с згу")):
+        reasons.append("Указана 1С:ЗГУ; в резюме подтверждена другая конфигурация — 1С:БГУ")
     elif "1с:зуп" in text or "1с зуп" in text:
-        score += 2
-        reasons.append("Указана 1С:ЗУП; в резюме подтверждена 1С:БГУ, а не ЗУП")
+        reasons.append("Указана 1С:ЗУП; в резюме подтверждена другая конфигурация — 1С:БГУ")
     elif "1с" in text:
         score += 2
         reasons.append("Упоминается 1С; конфигурация не уточнена")
@@ -243,6 +244,18 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     if "сочи" in city:
         score += 4
         reasons.append("Локация — Сочи")
+
+    # A vacancy can match the duties almost perfectly while still requiring
+    # systems not confirmed in the candidate's CV. Keep it attractive, but do
+    # not report a perfect score when required software gaps need clarification.
+    software_conflicts = required_software_conflicts(description)
+    if software_conflicts:
+        deduction = min(30, len(software_conflicts) * 7)
+        score = max(0, score - deduction)
+        reasons.append(
+            f"Снижение оценки на {deduction} баллов: не подтверждён опыт работы "
+            f"с обязательным ПО ({len(software_conflicts)} требования)"
+        )
 
     return min(score, 100), reasons
 
