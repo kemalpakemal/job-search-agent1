@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from config import PROFILE, settings
 from connectors import VacancyConnectors
 from database import AppSetting, SearchRun, SessionLocal, Vacancy
-from scoring import (build_cover_letter, salary_decision, score_vacancy, is_profile_relevant, has_experience_conflict, has_training_offer)
+from scoring import (build_cover_letter, salary_decision, score_vacancy, is_profile_relevant, has_experience_conflict, has_training_offer, required_software_conflicts)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # HTTPX logs full Telegram Bot API URLs, which contain the bot token.
@@ -126,6 +126,7 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
         and any(term in normalized_details for term in ("требуется", "обязательно", "уверенное владение", "опыт работы"))
         and not training
     )
+    software_conflicts = required_software_conflicts(normalized_details)
 
     review_reasons: list[str] = []
     if not city_ok:
@@ -144,6 +145,7 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
         review_reasons.append("Требуется оконченное высшее образование; в резюме оно указано как незавершённое")
     if zup_required:
         review_reasons.append("Требуется 1С:ЗУП; в резюме подтверждена 1С:БГУ, опыт ЗУП не заявлен")
+    review_reasons.extend(software_conflicts)
 
     if salary_bucket == "rejected":
         bucket = "rejected"
@@ -154,6 +156,7 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
     elif (
         salary_bucket == "qualified" and city_ok and schedule_known_ok
         and not experience_conflict and not education_conflict and not zup_required
+        and not software_conflicts
     ):
         bucket = "qualified"
     else:
