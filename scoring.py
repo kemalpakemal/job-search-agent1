@@ -248,6 +248,7 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     # A vacancy can match the duties almost perfectly while still requiring
     # systems not confirmed in the candidate's CV. Keep it attractive, but do
     # not report a perfect score when required software gaps need clarification.
+    score = min(score, 100)
     software_conflicts = required_software_conflicts(description)
     if software_conflicts:
         deduction = min(30, len(software_conflicts) * 7)
