@@ -121,6 +121,19 @@ async def _answer_callback(callback_id: str, text: str = "", alert: bool = False
         log.warning("Could not answer Telegram callback (%s)", type(exc).__name__)
 
 
+def _format_search_summary(result: dict[str, Any], queue_counts: dict[str, int]) -> str:
+    qualified = int(result.get("qualified", 0))
+    review = int(result.get("review", 0))
+    found = qualified + review
+    if not found:
+        return "Поиск завершён.\\nПодходящих вакансий не нашёл."
+    return (
+        "Поиск завершён.\\n"
+        f"Нашёл: {found} вакансий ({qualified} подходят, {review} нужно проверить).\\n"
+        f"Новые: {queue_counts['new']} · Просмотренные: {queue_counts['viewed']}."
+    )
+
+
 def _count(db, bucket: str | None = None, status: str | None = None) -> int:
     stmt = select(func.count(Vacancy.id))
     if bucket:
@@ -420,9 +433,7 @@ async def _run_search_for_chat(chat_id: int) -> None:
             if search_fn is None:
                 await _send(chat_id, "Функция поиска не инициализирована. Проверь журнал сервера.", MAIN_MENU)
                 return
-            started = asyncio.get_running_loop().time()
             result = await search_fn(notify=False)
-            elapsed = int(asyncio.get_running_loop().time() - started)
             db = SessionLocal()
             try:
                 browsable_jobs = db.scalars(
@@ -432,27 +443,7 @@ async def _run_search_for_chat(chat_id: int) -> None:
             finally:
                 db.close()
 
-            rejected_count = result.get("rejected", 0)
-            report = (
-                "Поиск завершён.\n"
-                f"Получено от источников: {result.get('received', 0)}\n"
-                f"Впервые добавлено в базу: {result.get('inserted', 0)}\n"
-                f"Уже было в базе и обновлено: {result.get('updated', 0)}\n"
-                f"Подходят по профилю и условиям: {result.get('qualified', 0)}\n"
-                f"Нужна ручная проверка: {result.get('review', 0)}\n"
-                f"Отсеяно фильтрами: {rejected_count}\n\n"
-                "Сейчас в очередях бота:\n"
-                f"Новые: {queue_counts['new']}\n"
-                f"Просмотренные: {queue_counts['viewed']}\n"
-                f"Время: {elapsed} сек.\n\n"
-            )
-            if queue_counts["new"]:
-                report += "Нажми «Новые», чтобы открыть ещё не просмотренные подходящие вакансии."
-            elif queue_counts["viewed"]:
-                report += "Новых карточек нет: подходящие вакансии уже находятся в «Просмотренных»."
-            else:
-                report += "В очередях нет подходящих карточек. Остальные результаты отсеяны фильтрами или требуют повторной проверки источника."
-            report += "\nОтклики не отправлялись."
+            report = _format_search_summary(result, queue_counts)
             await _send(chat_id, report, MAIN_MENU)
     except asyncio.CancelledError:
         log.info("Manual Telegram search cancelled during shutdown")
