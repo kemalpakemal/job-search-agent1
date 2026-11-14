@@ -156,7 +156,7 @@ def _parse_hh_rss(xml_content: bytes, area_name: str = "Сочи") -> list[dict[
         full_description = " ".join(part for part in (description, extra_salary) if part).strip()[:12000]
         employer = (
             fields.get("company") or fields.get("employer")
-            or _rss_labeled_value(description, ("Компания", "Работодатель", "Организация"))
+            or _rss_labeled_value(description, ("Вакансия компании", "Компания", "Работодатель", "Организация"))
             or "Работодатель не указан"
         )
         schedule = (
