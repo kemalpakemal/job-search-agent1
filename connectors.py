@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 import asyncio
 import hashlib
+import imaplib
 import os
 import re
-from urllib.parse import urljoin
+import email
+from email import policy
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin, urlsplit, parse_qs, unquote
 from html import unescape as html_unescape
 import xml.etree.ElementTree as ET
 from typing import Any
@@ -121,6 +127,242 @@ def _rss_labeled_value(text: str, labels: tuple[str, ...]) -> str:
     names = "|".join(re.escape(label) for label in labels)
     match = re.search(rf"(?im)(?:^|\n)\s*(?:{names})\s*[:—-]\s*([^\n]+)", text)
     return match.group(1).strip(" \t.;") if match else ""
+
+
+
+EMAIL_ALERT_SOURCES = {
+    "zarplata.ru": "Зарплата.ру",
+    "rabota.ru": "Работа.ру",
+    "joblab.ru": "JobLab",
+    "careerist.ru": "Careerist",
+}
+
+
+class _EmailAlertHTMLParser(HTMLParser):
+    """Extract visible text and anchor positions from a job-alert email."""
+    BLOCK_TAGS = {"p", "div", "li", "tr", "td", "br", "h1", "h2", "h3", "section"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.text_parts: list[str] = []
+        self.links: list[dict[str, Any]] = []
+        self.current_link: dict[str, Any] | None = None
+
+    def _newline(self) -> None:
+        if self.text_parts and self.text_parts[-1] != "\\n":
+            self.text_parts.append("\\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self.BLOCK_TAGS:
+            self._newline()
+        if tag == "a":
+            href = dict(attrs).get("href")
+            if href:
+                self.current_link = {
+                    "href": str(href),
+                    "text": [],
+                    "position": len("".join(self.text_parts)),
+                }
+
+    def handle_data(self, data: str) -> None:
+        value = re.sub(r"\\s+", " ", data).strip()
+        if not value:
+            return
+        self.text_parts.append(value + " ")
+        if self.current_link is not None:
+            self.current_link["text"].append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.current_link is not None:
+            self.links.append(self.current_link)
+            self.current_link = None
+        if tag in self.BLOCK_TAGS:
+            self._newline()
+
+
+def _email_alert_target_url(href: str) -> str:
+    """Unwrap common email click-through URLs only when they expose a destination."""
+    candidate = html_unescape(href.strip())
+    for _ in range(2):
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").lower()
+        if any(host == domain or host.endswith("." + domain) for domain in EMAIL_ALERT_SOURCES):
+            return candidate
+        query = parse_qs(parsed.query)
+        destination = next(
+            (
+                values[0] for key, values in query.items()
+                if key.lower() in {"url", "u", "target", "redirect", "redirect_url", "vacancy_url"}
+                and values
+            ),
+            "",
+        )
+        if not destination:
+            return ""
+        candidate = unquote(destination)
+    parsed = urlsplit(candidate)
+    host = (parsed.hostname or "").lower()
+    return candidate if any(
+        host == domain or host.endswith("." + domain) for domain in EMAIL_ALERT_SOURCES
+    ) else ""
+
+
+def _email_alert_title(anchor_text: str, context: str, url: str) -> str:
+    generic = {
+        "подробнее", "посмотреть", "смотреть вакансию", "откликнуться",
+        "откликнуться на вакансию", "открыть вакансию", "перейти",
+        "вакансия", "смотреть", "читать далее",
+    }
+    title = " ".join(anchor_text.split()).strip(" •—-")
+    if 8 <= len(title) <= 180 and title.lower() not in generic:
+        return title
+
+    lines = [
+        " ".join(line.split()).strip(" •—-")
+        for line in re.split(r"[\\r\\n]+", context)
+    ]
+    skip = (
+        "зарплат", "руб", "₽", "на руки", "до вычета", "отклик",
+        "подробнее", "посмотреть", "график", "опыт работы", "сочи",
+        "присылать вам", "вы получили", "отписаться", "настроить подписку",
+    )
+    for line in reversed(lines[-12:]):
+        low = line.lower()
+        if not (8 <= len(line) <= 180) or low in generic:
+            continue
+        if any(word in low for word in skip):
+            continue
+        if re.fullmatch(r"[\\d\\s.,:/–—-]+", line):
+            continue
+        return line
+
+    path = urlsplit(url).path.rstrip("/")
+    segment = unquote(path.split("/")[-1]) if path else ""
+    if segment and not segment.isdigit():
+        segment = re.sub(r"[-_]+", " ", segment)
+        if 8 <= len(segment) <= 120:
+            return segment
+    return ""
+
+
+def _parse_email_alert_html(
+    html_body: str,
+    sender_domain: str,
+    received_at: str = "",
+    max_links: int = 30,
+) -> list[dict[str, Any]]:
+    """Turn first-party vacancy-alert email links into reviewable vacancy cards."""
+    source = next(
+        (
+            name for domain, name in EMAIL_ALERT_SOURCES.items()
+            if sender_domain.lower() == domain or sender_domain.lower().endswith("." + domain)
+        ),
+        "",
+    )
+    if not source:
+        return []
+
+    parser = _EmailAlertHTMLParser()
+    parser.feed(html_body or "")
+    visible_text = "".join(parser.text_parts)
+    visible_text = html_unescape(re.sub(r"\\n{3,}", "\\n\\n", visible_text))
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for anchor in parser.links[:max_links]:
+        url = _email_alert_target_url(str(anchor.get("href") or ""))
+        if not url:
+            continue
+        parsed = urlsplit(url)
+        path_low = parsed.path.lower()
+        if any(term in path_low for term in (
+            "unsubscribe", "subscription", "notification-settings", "settings",
+            "login", "register", "privacy", "terms", "feedback", "support",
+        )):
+            continue
+
+        normalized_url = url.split("#", 1)[0]
+        key = normalized_url.rstrip("/")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+
+        position = int(anchor.get("position") or 0)
+        context = visible_text[max(0, position - 500):min(len(visible_text), position + 350)]
+        anchor_text = " ".join(anchor.get("text") or [])
+        title = _email_alert_title(anchor_text, context, url)
+        if not title:
+            continue
+
+        domain = (parsed.hostname or "").lower()
+        actual_source = next(
+            (
+                name for source_domain, name in EMAIL_ALERT_SOURCES.items()
+                if domain == source_domain or domain.endswith("." + source_domain)
+            ),
+            source,
+        )
+        id_match = re.search(r"(\\d{6,})", parsed.path)
+        external_id = id_match.group(1) if id_match else hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+        salary_min, salary_max, currency, salary_type = _rss_salary(context)
+        schedule_match = re.search(r"(?i)(?<!\\d)(5\\s*/\\s*2|2\\s*/\\s*2|3\\s*/\\s*3|6\\s*/\\s*1)(?!\\d)", context)
+        schedule = re.sub(r"\\s+", "", schedule_match.group(1)) if schedule_match else ""
+        experience_match = re.search(
+            r"(?i)(без опыта|опыт работы от [^,.;\\n]{1,45}|от [1-6] лет опыта)",
+            context,
+        )
+        employer_match = re.search(r"(?im)(?:компания|работодатель)\\s*[:—-]\\s*([^\\n]{2,100})", context)
+        description = (
+            "Из почтовой подписки. Содержимое письма: "
+            + " ".join(context.split())[:1500]
+            + " Полное описание открой по ссылке."
+        )
+
+        results.append({
+            "source": actual_source,
+            "external_id": external_id,
+            "title": title[:500],
+            "employer": employer_match.group(1).strip() if employer_match else "Работодатель не указан",
+            # The user configures each site subscription for Sochi; explicit city
+            # information in the alert will be retained when present.
+            "city": settings.target_city,
+            "description": description[:4000],
+            "salary_min": salary_min,
+            "salary_max": salary_max,
+            "currency": currency or "RUB",
+            "salary_type": salary_type,
+            "schedule": schedule,
+            "experience": experience_match.group(1).strip() if experience_match else "",
+            "published_at": received_at,
+            "url": url,
+        })
+    return results
+
+
+def _extract_email_body(message: email.message.Message) -> str:
+    """Return HTML body where available, otherwise plain text."""
+    html_parts: list[str] = []
+    plain_parts: list[str] = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        content_type = part.get_content_type()
+        if content_type not in {"text/html", "text/plain"}:
+            continue
+        try:
+            payload = part.get_content()
+        except Exception:
+            raw = part.get_payload(decode=True) or b""
+            payload = raw.decode(part.get_content_charset() or "utf-8", errors="replace")
+        if not isinstance(payload, str):
+            continue
+        if content_type == "text/html":
+            html_parts.append(payload)
+        else:
+            plain_parts.append(payload)
+    return "\\n".join(html_parts) if html_parts else "<pre>" + "\\n".join(plain_parts) + "</pre>"
+
 
 
 def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, float | None, str | None, str]:
@@ -862,6 +1104,95 @@ class VacancyConnectors:
             note += f" Не удалось выполнить запросов: {failed_queries}."
         return list(unique.values()), note
 
+    async def email_alerts(self) -> tuple[list[dict[str, Any]], str]:
+        """Read only first-party vacancy-alert messages from configured job sites."""
+        user = os.getenv("MAIL_IMAP_USER", "").strip()
+        password = os.getenv("MAIL_IMAP_APP_PASSWORD", "").strip()
+        if not user or not password:
+            return [], (
+                "Отключено: для почтовых подписок Зарплата.ру, Работа.ру, JobLab и Careerist "
+                "нужны MAIL_IMAP_USER и MAIL_IMAP_APP_PASSWORD. Основной пароль почты не используется."
+            )
+
+        host = os.getenv("MAIL_IMAP_HOST", "imap.mail.ru").strip()
+        try:
+            port = max(1, min(65535, int(os.getenv("MAIL_IMAP_PORT", "993"))))
+            lookback_days = max(1, min(60, int(os.getenv("MAIL_IMAP_LOOKBACK_DAYS", "14"))))
+            max_per_source = max(1, min(50, int(os.getenv("MAIL_IMAP_MAX_EMAILS_PER_SOURCE", "20"))))
+        except ValueError:
+            port, lookback_days, max_per_source = 993, 14, 20
+
+        def read_mailbox() -> tuple[list[dict[str, Any]], dict[str, int]]:
+            mailbox = imaplib.IMAP4_SSL(host, port, timeout=25)
+            gathered: list[dict[str, Any]] = []
+            counts = {name: 0 for name in EMAIL_ALERT_SOURCES.values()}
+            try:
+                mailbox.login(user, password)
+                status, _ = mailbox.select(os.getenv("MAIL_IMAP_FOLDER", "INBOX"), readonly=True)
+                if status != "OK":
+                    raise RuntimeError("Не удалось открыть папку входящих писем в режиме чтения")
+
+                since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%d-%b-%Y")
+                max_total = max_per_source * len(EMAIL_ALERT_SOURCES)
+                total_read = 0
+                for domain, source_name in EMAIL_ALERT_SOURCES.items():
+                    status, payload = mailbox.uid("SEARCH", None, f'(SINCE "{since}" FROM "{domain}")')
+                    if status != "OK" or not payload or not payload[0]:
+                        continue
+                    uids = payload[0].split()[-max_per_source:]
+                    for uid in reversed(uids):
+                        if total_read >= max_total:
+                            break
+                        status, fetched = mailbox.uid("FETCH", uid, "(BODY.PEEK[])")
+                        if status != "OK":
+                            continue
+                        raw_message = next(
+                            (entry[1] for entry in fetched if isinstance(entry, tuple) and isinstance(entry[1], bytes)),
+                            None,
+                        )
+                        if not raw_message:
+                            continue
+                        message = email.message_from_bytes(raw_message, policy=policy.default)
+                        sender = email.utils.parseaddr(str(message.get("From") or ""))[1].lower()
+                        sender_domain = sender.rsplit("@", 1)[-1] if "@" in sender else ""
+                        actual_source = next(
+                            (
+                                name for known_domain, name in EMAIL_ALERT_SOURCES.items()
+                                if sender_domain == known_domain or sender_domain.endswith("." + known_domain)
+                            ),
+                            "",
+                        )
+                        if not actual_source:
+                            continue
+                        date_value = ""
+                        try:
+                            parsed_date = parsedate_to_datetime(str(message.get("Date") or ""))
+                            date_value = parsed_date.isoformat() if parsed_date else ""
+                        except Exception:
+                            pass
+                        body = _extract_email_body(message)
+                        links = _parse_email_alert_html(body, sender_domain, date_value)
+                        if links:
+                            counts[actual_source] += len(links)
+                            gathered.extend(links)
+                        total_read += 1
+                return gathered, counts
+            finally:
+                try:
+                    mailbox.logout()
+                except Exception:
+                    pass
+
+        items, counts = await asyncio.to_thread(read_mailbox)
+        summary = ", ".join(
+            f"{name}: {count}" for name, count in counts.items()
+        )
+        return items, (
+            f"Почтовые уведомления проверены только от четырёх выбранных площадок "
+            f"за {lookback_days} дней; прочитано писем и извлечено карточек: {summary}. "
+            "Почта открывается только в режиме чтения, сообщения не помечаются прочитанными и не удаляются."
+        )
+
     async def avito(self) -> tuple[list[dict[str, Any]], str]:
         """Search public Avito Work vacancies using the documented Job API."""
         client_id = os.getenv("AVITO_CLIENT_ID", "").strip()
@@ -1212,7 +1543,7 @@ class VacancyConnectors:
             ("HeadHunter", self.hh),
             ("SuperJob", self.superjob),
             ("Работа России", self.trudvsem),
-            ("Авито Работа", self.avito),
+            ("Почтовые подписки", self.email_alerts),
         )
 
         async def run_source(name: str, func: Any) -> tuple[str, list[dict[str, Any]], str]:
@@ -1230,7 +1561,7 @@ class VacancyConnectors:
         for name, items, status in results:
             all_items.extend(items)
             statuses[name] = status
-        statuses["Зарплата.ру"] = "Ручной источник: публичный API поиска вакансий для соискателей не подтверждён; скрытый сбор не используется"
-        statuses["Работа.ру"] = "Ручной источник: автоматизация допустима только через официальный API и в пределах выданных прав"
-        statuses["Сайты работодателей"] = "Ручной источник: можно подключать по отдельности при наличии официального фида/API"
+        if not os.getenv("MAIL_IMAP_APP_PASSWORD", "").strip():
+            for source_name in EMAIL_ALERT_SOURCES.values():
+                statuses[source_name] = "Ожидает подписки на вакансии и настройки отдельного пароля приложения Mail.ru"
         return all_items, statuses
