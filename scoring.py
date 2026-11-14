@@ -169,8 +169,20 @@ def _software_is_optional(value: str, variants: tuple[str, ...]) -> bool:
             index = value.find(variant, start)
             if index < 0:
                 break
-            left = max(0, index - 65)
-            right = min(len(value), index + len(variant) + 65)
+            end = index + len(variant)
+            boundaries_before = [
+                value.rfind(mark, 0, index)
+                for mark in (".", ";", "!", "?", "\n")
+            ]
+            boundaries_after = [
+                pos for pos in (
+                    value.find(mark, end)
+                    for mark in (".", ";", "!", "?", "\n")
+                ) if pos >= 0
+            ]
+            left = max(max(boundaries_before) + 1, index - 65)
+            right = min(min(boundaries_after) if boundaries_after else len(value),
+                        end + 65)
             if markers.search(value[left:right]):
                 return True
             start = index + len(variant)
