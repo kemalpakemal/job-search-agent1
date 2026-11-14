@@ -140,7 +140,9 @@ def _job_text(job: Vacancy, review: bool = False) -> str:
     if reasons:
         text += "\n\nПочему подходит:\n• " + "\n• ".join(reasons[:3])
     if review and job.review_reason:
-        text += "\n\n⚠️ Требует проверки:\n" + job.review_reason
+        review_items = [item.strip(" .") for item in job.review_reason.split(";") if item.strip(" .")]
+        if review_items:
+            text += "\n\n⚠️ Требует проверки:\n• " + "\n• ".join(review_items[:7])
     if job.description:
         desc = " ".join(job.description.split())[:650]
         if desc:
@@ -177,7 +179,14 @@ def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | No
             ),
         )
     else:
-        stmt = stmt.where(Vacancy.bucket == bucket, Vacancy.user_status.in_(["new", "drafted"]))
+        # Legacy records with a NULL user status should remain visible until acted on.
+        stmt = stmt.where(
+            Vacancy.bucket == bucket,
+            or_(
+                Vacancy.user_status.is_(None),
+                Vacancy.user_status.in_(["new", "drafted"]),
+            ),
+        )
     if before_id is not None:
         stmt = stmt.where(Vacancy.id < before_id)
     return db.scalars(stmt.limit(1)).first()
@@ -248,7 +257,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
                 int(chat_id),
                 "Агент поиска работы запущен.\n\n"
                 f"Город: {settings.target_city}\nМинимум: {settings.min_net_salary:,} ₽ на руки\n"
-                "График: 5/2\nПорог соответствия: 80/100\n\n"
+                "График: 5/2\nОценка совпадения: 90–100 для прямых зарплатных должностей\n\n"
                 "Отклики автоматически не отправляются. Ты просматриваешь вакансии и сам решаешь, что делать.",
                 MAIN_MENU,
             )
@@ -314,7 +323,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
             int(chat_id),
             "Текущие параметры поиска:\n\n"
             f"Город: {settings.target_city}\nМинимум: {settings.min_net_salary:,} ₽ на руки\n"
-            "График: 5/2\nПорог соответствия: 80/100\n"
+            "График: 5/2\nОценка совпадения: 90–100 для прямых зарплатных должностей\n"
             f"Интервал поиска: {settings.search_interval_hours} ч.\nОтклики: только после ручного подтверждения.",
             MAIN_MENU,
         )

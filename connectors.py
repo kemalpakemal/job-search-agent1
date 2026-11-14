@@ -115,12 +115,12 @@ def _rss_labeled_value(text: str, labels: tuple[str, ...]) -> str:
 def _rss_salary(text: str, separate_salary: str = "") -> tuple[float | None, float | None, str | None, str]:
     # Parse only lines that look like salary information; do not mistake IDs or other numbers for pay.
     lines = [line for line in (separate_salary + "\n" + text).splitlines()
-             if any(token in line.lower() for token in ("зарплат", "оплат", "доход", "₽", "руб"))]
+             if any(token in line.lower() for token in ("зарплат", "оплат", "доход", "₽", "руб", "rub", "rur", "salary"))]
     candidate = " ".join(lines)
     pattern = (
         r"(?i)(?:от\s*)?(\d[\d\s\u00a0\u202f]{2,})"
         r"(?:\s*(?:[-–—]|до)\s*(\d[\d\s\u00a0\u202f]{2,}))?"
-        r"\s*(?:₽|руб(?:\.|лей|ля|ль)?)"
+        r"\s*(?:₽|руб(?:\.|лей|ля|ль)?|rub|rur)"
     )
     match = re.search(pattern, candidate)
     if not match:

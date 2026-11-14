@@ -111,9 +111,36 @@ TRAINING_TERMS = (
 )
 
 
+def _training_term_is_negated(value: str, term: str, start: int) -> bool:
+    end = start + len(term)
+    before = value[max(0, start - 45):start]
+    after = value[end:end + 45]
+
+    if "без опыта" in term:
+        if re.search(r"не\s+рассматриваем(?:\s+\w+){0,3}\s*$", before):
+            return True
+        if re.match(r"\s*(?:мы\s+)?не\s+рассматриваем\b", after):
+            return True
+
+    if "обуч" in term or "науч" in term:
+        if re.search(r"\bне\s+(?:(?:будем|готовы|готова)\s+)?$", before):
+            return True
+        local = value[max(0, start - 20):min(len(value), end + 15)]
+        if re.search(r"\bне\s+(?:(?:будем|готовы|готова)\s+)?(?:обучать|обучим|обучаем|научим)\b", local):
+            return True
+
+    return False
+
+
 def has_training_offer(text: str | None) -> bool:
     value = normalized(text)
-    return any(term in value for term in TRAINING_TERMS)
+    for term in TRAINING_TERMS:
+        start = value.find(term)
+        while start >= 0:
+            if not _training_term_is_negated(value, term, start):
+                return True
+            start = value.find(term, start + 1)
+    return False
 
 
 def has_experience_conflict(text: str | None) -> bool:
@@ -130,24 +157,49 @@ def has_experience_conflict(text: str | None) -> bool:
     ))
 
 
+def _software_is_optional(value: str, variants: tuple[str, ...]) -> bool:
+    markers = re.compile(
+        r"желател\w*|приветств\w*|будет.{0,30}(?:плюсом|преимуществом)|"
+        r"не\s+обязательн\w*|необязательн\w*|не\s+требуется|не\s+нужен|"
+        r"дополнительн\w*\s+преимуществ\w*"
+    )
+    for variant in variants:
+        start = 0
+        while True:
+            index = value.find(variant, start)
+            if index < 0:
+                break
+            left = max(0, index - 65)
+            right = min(len(value), index + len(variant) + 65)
+            if markers.search(value[left:right]):
+                return True
+            start = index + len(variant)
+    return False
+
+
 def required_software_conflicts(text: str | None) -> list[str]:
-    """Flag employer-required software not confirmed in the candidate's resume.
+    """Flag required, non-optional software absent from the candidate's resume.
 
     The profile confirms 1C:BGU and Excel, but not 1C:ZGU, Parus or the
-    Web Budget Execution system. Training offers override these gaps.
+    Web Budget Execution system. Optional/preferred skills are not blockers.
     """
     value = normalized(text)
     if has_training_offer(value):
         return []
     conflicts: list[str] = []
-    if any(term in value for term in ("1с:згу", "1с згу", "1c:згу", "1c згу")) and not any(
-        term in value for term in ("не требуется 1с:згу", "1с:згу не требуется")
-    ):
+
+    zgu_terms = ("1с:згу", "1с згу", "1c:згу", "1c згу")
+    if any(term in value for term in zgu_terms) and not _software_is_optional(value, zgu_terms):
         conflicts.append("Указана 1С:ЗГУ; в резюме подтверждена 1С:БГУ — нужно уточнить, готовы ли обучить")
-    if "парус" in value and not any(term in value for term in ("парус не требуется", "без паруса")):
+
+    parus_terms = ("парус",)
+    if "парус" in value and not _software_is_optional(value, parus_terms):
         conflicts.append("Указана программа «Парус»; опыт работы с ней в резюме не подтверждён")
-    if any(term in value for term in ("веб исполнение бюджета", "веб-исполнение бюджета", "веб исполнению бюджета")):
+
+    web_terms = ("веб исполнение бюджета", "веб-исполнение бюджета", "веб исполнению бюджета")
+    if any(term in value for term in web_terms) and not _software_is_optional(value, web_terms):
         conflicts.append("Указана система «Веб-исполнение бюджета»; опыт работы с ней в резюме не подтверждён")
+
     return conflicts
 
 
@@ -218,10 +270,10 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     if "1с:бгу" in text or "1с бгу" in text:
         score += 7
         reasons.append("Совпадает используемая кандидатом система 1С:БГУ")
-    elif any(term in text for term in ("1с:згу", "1с згу")):
-        reasons.append("Указана 1С:ЗГУ; в резюме подтверждена другая конфигурация — 1С:БГУ")
-    elif "1с:зуп" in text or "1с зуп" in text:
-        reasons.append("Указана 1С:ЗУП; в резюме подтверждена другая конфигурация — 1С:БГУ")
+    elif any(term in text for term in ("1с:згу", "1с згу", "1с:зуп", "1с зуп")):
+        # A different configuration is a verification item, not a reason the
+        # vacancy matches. The review queue carries the explicit warning.
+        pass
     elif "1с" in text:
         score += 2
         reasons.append("Упоминается 1С; конфигурация не уточнена")
@@ -251,10 +303,6 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     if software_conflicts:
         deduction = min(8, len(software_conflicts) * 2)
         score = max(0, score - deduction)
-        reasons.append(
-            f"Снижение оценки на {deduction} баллов: не подтверждён опыт работы "
-            f"с обязательным ПО ({len(software_conflicts)} требования)"
-        )
 
     if title_match:
         # Direct payroll roles are deliberately displayed in a 90-100 band:
