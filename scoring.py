@@ -245,10 +245,8 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
         score += 4
         reasons.append("Локация — Сочи")
 
-    # A vacancy can match the duties almost perfectly while still requiring
-    # systems not confirmed in the candidate's CV. Keep it attractive, but do
-    # not report a perfect score when required software gaps need clarification.
-    score = min(score, 100)
+    # Keep an uncapped internal score so strong vacancies do not all collapse to 100.
+    # Required-software gaps remain warnings and apply a modest deduction.
     software_conflicts = required_software_conflicts(description)
     if software_conflicts:
         deduction = min(8, len(software_conflicts) * 2)
@@ -257,6 +255,14 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
             f"Снижение оценки на {deduction} баллов: не подтверждён опыт работы "
             f"с обязательным ПО ({len(software_conflicts)} требования)"
         )
+
+    if title_match:
+        # Direct payroll roles are deliberately displayed in a 90-100 band:
+        # 90 = title match with sparse supporting data; 100 = unusually strong
+        # fit across duties, systems, experience, schedule and location.
+        # This is a relative fit index, not a literal percentage probability.
+        calibrated = 90 + round((min(score, 146) - 70) * 10 / 76)
+        return max(90, min(100, calibrated)), reasons
 
     return min(score, 100), reasons
 
