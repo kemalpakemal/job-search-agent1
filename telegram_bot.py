@@ -325,7 +325,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
         if _search_lock.locked() or (_search_task is not None and not _search_task.done()):
             await _send(int(chat_id), "Поиск уже выполняется. Я сообщу результат отдельным сообщением.")
             return
-        await _send(int(chat_id), "Поиск запущен в фоне. Бот продолжит отвечать на кнопки и команды; результат пришлю отдельным сообщением.", MAIN_MENU)
+        await _send(int(chat_id), "Поиск запущен, жди Катюша.\nСкоро отвечу.", MAIN_MENU)
         _search_task = asyncio.create_task(_run_search_for_chat(int(chat_id)), name=f"telegram-search-{chat_id}")
         return
 
