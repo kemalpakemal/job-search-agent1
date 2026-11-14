@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from html import unescape as html_unescape
 import xml.etree.ElementTree as ET
@@ -9,10 +10,26 @@ from urllib.parse import quote_plus
 
 import httpx
 
-from config import SEARCH_TERMS, settings
+from config import settings
 from scoring import classify_salary_type
 
 TIMEOUT = httpx.Timeout(20.0, connect=10.0)
+
+# Queries stay inside the candidate's payroll-accounting occupation.
+PAYROLL_SEARCH_TERMS = (
+    "бухгалтер по расчету заработной платы",
+    "бухгалтер по зарплате",
+    "ведущий бухгалтер по расчету заработной платы",
+    "ведущий бухгалтер по заработной плате",
+    "бухгалтер-расчетчик",
+    "бухгалтер расчетчик зарплаты",
+    "специалист по расчету заработной платы",
+    "специалист по начислению заработной платы",
+    "бухгалтер по расчетам с персоналом",
+    "специалист по оплате труда",
+    "расчетная группа заработная плата",
+    "бухгалтер по зарплате 1С БГУ",
+)
 
 
 def _money(value: Any) -> float | None:
@@ -178,6 +195,180 @@ class VacancyConnectors:
         response.raise_for_status()
         return response.json()
 
+    async def _enrich_hh(self, item: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+        """Replace the short RSS snippet with the full public vacancy card when available."""
+        vacancy_id = str(item.get("external_id") or "")
+        if not vacancy_id.isdigit():
+            return item
+        try:
+            detail = await self._get_json(
+                f"https://api.hh.ru/vacancies/{vacancy_id}",
+                headers={**headers, "Accept": "application/json"},
+            )
+        except Exception:
+            return item
+
+        salary = detail.get("salary") or {}
+        address = detail.get("address") or {}
+        area = detail.get("area") or {}
+        employer = detail.get("employer") or {}
+        schedule = detail.get("schedule") or {}
+        experience = detail.get("experience") or {}
+        description = _rss_plain_text(detail.get("description") or "")
+        skills = detail.get("key_skills") or []
+        skill_names = [str(x.get("name")) for x in skills if isinstance(x, dict) and x.get("name")]
+        if skill_names:
+            description += "\nНавыки: " + ", ".join(skill_names)
+        employment = detail.get("employment") or {}
+        if employment.get("name"):
+            description += "\nЗанятость: " + str(employment["name"])
+        if salary:
+            salary_line = "Зарплата: "
+            if salary.get("from") is not None:
+                salary_line += "от " + str(salary["from"])
+            if salary.get("to") is not None:
+                salary_line += " до " + str(salary["to"])
+            salary_line += " " + str(salary.get("currency") or "RUB")
+            salary_line += " до вычета НДФЛ" if salary.get("gross") else " на руки"
+            description += "\n" + salary_line
+
+        item.update({
+            "description": description[:12000] or item.get("description", ""),
+            "employer": employer.get("name") or item.get("employer"),
+            "city": (address.get("city") if isinstance(address, dict) else None) or area.get("name") or item.get("city"),
+            "salary_min": salary.get("from") if salary.get("from") is not None else item.get("salary_min"),
+            "salary_max": salary.get("to") if salary.get("to") is not None else item.get("salary_max"),
+            "currency": salary.get("currency") or item.get("currency") or ("RUB" if salary else None),
+            "salary_type": classify_salary_type(
+                description,
+                explicit_gross=salary.get("gross") if isinstance(salary.get("gross"), bool) else None,
+            ),
+            "schedule": schedule.get("name") or item.get("schedule"),
+            "experience": experience.get("name") or item.get("experience"),
+            "url": detail.get("alternate_url") or detail.get("url") or item.get("url"),
+        })
+        return item
+
+    async def avito(self) -> tuple[list[dict[str, Any]], str]:
+        """Use Avito's Job API only; no public-site scraping."""
+        client_id = os.getenv("AVITO_CLIENT_ID", "").strip()
+        client_secret = os.getenv("AVITO_CLIENT_SECRET", "").strip()
+        location_id = os.getenv("AVITO_LOCATION_ID", "").strip()
+        if not client_id or not client_secret or not location_id:
+            return [], (
+                "Автоматический поиск не активирован: нужны AVITO_CLIENT_ID, "
+                "AVITO_CLIENT_SECRET и AVITO_LOCATION_ID (город Сочи) из доступа к API Авито"
+            )
+
+        token_response = await self.client.post(
+            "https://api.avito.ru/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        token_response.raise_for_status()
+        access_token = token_response.json().get("access_token")
+        if not access_token:
+            raise RuntimeError("Avito API не вернул access_token")
+        headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+
+        gathered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for term in PAYROLL_SEARCH_TERMS:
+            response = await self.client.get(
+                "https://api.avito.ru/job/v2/vacancies",
+                params={
+                    "query": term,
+                    "location": location_id,
+                    "per_page": 100,
+                    "page": 1,
+                    "fields": "title,description,url,salary,start_time,update_time,is_active",
+                    "params": "address,schedule,experience,education",
+                },
+                headers=headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows: Any = []
+            if isinstance(payload, list):
+                rows = payload
+            elif isinstance(payload, dict):
+                for key in ("vacancies", "items", "results", "resources", "data"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        rows = value
+                        break
+                    if isinstance(value, dict):
+                        for nested in ("vacancies", "items", "results"):
+                            if isinstance(value.get(nested), list):
+                                rows = value[nested]
+                                break
+                        if rows:
+                            break
+
+            for raw_item in rows:
+                if not isinstance(raw_item, dict):
+                    continue
+                title = str(raw_item.get("title") or raw_item.get("name") or "").strip()
+                external_id = str(
+                    raw_item.get("id") or raw_item.get("vacancy_id")
+                    or raw_item.get("uuid") or raw_item.get("url") or ""
+                )
+                if not title or not external_id or external_id in seen:
+                    continue
+                seen.add(external_id)
+                description = _rss_plain_text(raw_item.get("description") or "")
+                salary = raw_item.get("salary")
+                salary_min = salary_max = None
+                currency = None
+                salary_type = "unknown"
+                if isinstance(salary, dict):
+                    salary_min = _money(salary.get("from") or salary.get("min"))
+                    salary_max = _money(salary.get("to") or salary.get("max"))
+                    currency = salary.get("currency") or "RUB"
+                    salary_type = classify_salary_type(
+                        description,
+                        explicit_gross=salary.get("gross") if isinstance(salary.get("gross"), bool) else None,
+                    )
+                elif salary:
+                    salary_min, salary_max, currency, salary_type = _rss_salary(description, str(salary))
+                address = raw_item.get("address") or {}
+                city = (
+                    address.get("city") or address.get("name") or settings.target_city
+                    if isinstance(address, dict) else str(address or settings.target_city)
+                )
+                schedule = raw_item.get("schedule") or ""
+                experience = raw_item.get("experience") or ""
+                if isinstance(schedule, dict):
+                    schedule = schedule.get("name") or schedule.get("title") or ""
+                if isinstance(experience, dict):
+                    experience = experience.get("name") or experience.get("title") or ""
+                gathered.append({
+                    "source": "Авито Работа",
+                    "external_id": external_id,
+                    "title": title,
+                    "employer": raw_item.get("company") or raw_item.get("employer") or "Работодатель не указан",
+                    "city": city,
+                    "description": description[:12000],
+                    "salary_min": salary_min,
+                    "salary_max": salary_max,
+                    "currency": currency,
+                    "salary_type": salary_type,
+                    "schedule": str(schedule),
+                    "experience": str(experience),
+                    "published_at": raw_item.get("start_time") or raw_item.get("update_time"),
+                    "url": raw_item.get("url") or "",
+                })
+            await asyncio.sleep(0.2)
+
+        return gathered, (
+            "Авито Работа через официальный Job API. Результаты зависят от выданных "
+            "аккаунту прав API; при отказе в доступе источник останется неактивным."
+        )
+
     async def hh(self) -> tuple[list[dict[str, Any]], str]:
         # The anonymous JSON vacancy-search endpoint began returning 403 in 2026.
         # Use HH's public search RSS instead; no applicant account, app key or CAPTCHA bypass.
@@ -193,7 +384,7 @@ class VacancyConnectors:
 
         gathered: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for term in SEARCH_TERMS:
+        for term in PAYROLL_SEARCH_TERMS:
             response = await self.client.get(
                 "https://hh.ru/search/vacancy/rss",
                 params={
@@ -232,7 +423,7 @@ class VacancyConnectors:
         if self._sj_town is None:
             return [], "Не удалось определить идентификатор Сочи в справочнике SuperJob"
         gathered: list[dict[str, Any]] = []
-        for term in SEARCH_TERMS:
+        for term in PAYROLL_SEARCH_TERMS:
             data = await self._get_json(
                 "https://api.superjob.ru/2.0/vacancies/",
                 params={"keyword": term, "town": self._sj_town, "count": 30, "page": 0, "payment_from": 1},
@@ -257,7 +448,7 @@ class VacancyConnectors:
     async def trudvsem(self) -> tuple[list[dict[str, Any]], str]:
         gathered: list[dict[str, Any]] = []
         base = "https://opendata.trudvsem.ru/api/v1/vacancies/region/" + quote_plus(settings.target_region_code)
-        for term in SEARCH_TERMS:
+        for term in PAYROLL_SEARCH_TERMS:
             data = await self._get_json(base, params={"text": term, "limit": 100, "offset": 0})
             results = data.get("results", {})
             items = results.get("vacancies", []) if isinstance(results, dict) else []
@@ -305,7 +496,7 @@ class VacancyConnectors:
     async def run_all(self) -> tuple[list[dict[str, Any]], dict[str, str]]:
         all_items: list[dict[str, Any]] = []
         statuses: dict[str, str] = {}
-        for name, func in (("HeadHunter", self.hh), ("SuperJob", self.superjob), ("Работа России", self.trudvsem)):
+        for name, func in (("HeadHunter", self.hh), ("SuperJob", self.superjob), ("Работа России", self.trudvsem), ("Авито Работа", self.avito)):
             try:
                 items, note = await func()
                 all_items.extend(items)
@@ -314,8 +505,7 @@ class VacancyConnectors:
                 statuses[name] = f"Ошибка HTTP {exc.response.status_code}: {exc.response.text[:250]}"
             except Exception as exc:
                 statuses[name] = f"Ошибка подключения/обработки: {type(exc).__name__}: {str(exc)[:250]}"
-        statuses["Зарплата.ру"] = "Ручной источник: официальная программная интеграция пока не настроена; используйте поиск по ссылке"
-        statuses["Работа.ру"] = "Ручной источник: официальный доступ к API для данного приложения не подтверждён"
-        statuses["Авито Работа"] = "Ручной источник: не используется скрытый сбор данных"
-        statuses["Сайты работодателей"] = "Ручной источник: добавляйте проверенные прямые ссылки на страницы вакансий"
+        statuses["Зарплата.ру"] = "Ручной источник: публичный API поиска вакансий для соискателей не подтверждён; скрытый сбор не используется"
+        statuses["Работа.ру"] = "Ручной источник: автоматизация допустима только через официально предоставленный API и в пределах выданных прав"
+        statuses["Сайты работодателей"] = "Ручной источник: можно подключать по отдельности при наличии официального фида/API"
         return all_items, statuses
