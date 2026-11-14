@@ -110,6 +110,19 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
     experience_text = f"{raw.get('experience') or ''} {raw.get('description') or ''}"
     training = has_training_offer(experience_text)
     experience_conflict = has_experience_conflict(experience_text)
+    normalized_details = experience_text.lower().replace("ё", "е")
+    education_conflict = any(term in normalized_details for term in (
+        "высшее образование обязательно",
+        "обязательно высшее образование",
+        "требуется высшее образование",
+        "наличие высшего образования",
+        "оконченное высшее образование",
+    ))
+    zup_required = (
+        ("1с:зуп" in normalized_details or "1с зуп" in normalized_details)
+        and any(term in normalized_details for term in ("требуется", "обязательно", "уверенное владение", "опыт работы"))
+        and not training
+    )
 
     review_reasons: list[str] = []
     if not city_ok:
@@ -124,6 +137,10 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
         score_reasons.append("Работодатель предлагает обучение или готов рассматривать без опыта")
     elif experience_conflict:
         review_reasons.append("В вакансии указано требование от 5 лет опыта; у кандидата подтверждено 4 года")
+    if education_conflict:
+        review_reasons.append("Требуется оконченное высшее образование; в резюме оно указано как незавершённое")
+    if zup_required:
+        review_reasons.append("Требуется 1С:ЗУП; в резюме подтверждена 1С:БГУ, опыт ЗУП не заявлен")
 
     if salary_bucket == "rejected":
         bucket = "rejected"
@@ -131,7 +148,10 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
         bucket = "rejected"
     elif schedule_conflict:
         bucket = "rejected"
-    elif salary_bucket == "qualified" and city_ok and schedule_known_ok and not experience_conflict:
+    elif (
+        salary_bucket == "qualified" and city_ok and schedule_known_ok
+        and not experience_conflict and not education_conflict and not zup_required
+    ):
         bucket = "qualified"
     else:
         bucket = "review"
