@@ -393,7 +393,7 @@ async def _run_search_for_chat(chat_id: int) -> None:
             await _send(
                 chat_id,
                 "Поиск завершён.\n"
-                f"Получено: {result.get('received', 0)}\nНовых: {result.get('inserted', 0)}\n"
+                f"Получено от источников: {result.get('received', 0)}\nДобавлено в базу: {result.get('inserted', 0)}\n"
                 f"Подходят: {result.get('qualified', 0)}\nНужна проверка: {result.get('review', 0)}\n"
                 f"Время: {elapsed} сек.\n\nНажми «Новые», чтобы открыть найденные карточки. "
                 "После показа они попадут в «Просмотренные».\nОтклики не отправлялись.",
