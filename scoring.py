@@ -130,6 +130,27 @@ def has_experience_conflict(text: str | None) -> bool:
     ))
 
 
+def required_software_conflicts(text: str | None) -> list[str]:
+    """Flag employer-required software not confirmed in the candidate's resume.
+
+    The profile confirms 1C:BGU and Excel, but not 1C:ZGU, Parus or the
+    Web Budget Execution system. Training offers override these gaps.
+    """
+    value = normalized(text)
+    if has_training_offer(value):
+        return []
+    conflicts: list[str] = []
+    if any(term in value for term in ("1с:згу", "1с згу", "1c:згу", "1c згу")) and not any(
+        term in value for term in ("не требуется 1с:згу", "1с:згу не требуется")
+    ):
+        conflicts.append("Указана 1С:ЗГУ; в резюме подтверждена 1С:БГУ — нужно уточнить, готовы ли обучить")
+    if "парус" in value and not any(term in value for term in ("парус не требуется", "без паруса")):
+        conflicts.append("Указана программа «Парус»; опыт работы с ней в резюме не подтверждён")
+    if any(term in value for term in ("веб исполнение бюджета", "веб-исполнение бюджета", "веб исполнению бюджета")):
+        conflicts.append("Указана система «Веб-исполнение бюджета»; опыт работы с ней в резюме не подтверждён")
+    return conflicts
+
+
 def _title_is_payroll(title: str) -> bool:
     return any(re.search(pattern, title) for pattern in PAYROLL_TITLE_PATTERNS)
 
