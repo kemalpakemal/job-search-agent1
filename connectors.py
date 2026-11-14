@@ -404,11 +404,22 @@ class VacancyConnectors:
                 gathered.append(item)
             await asyncio.sleep(0.25)
 
+        # Enrich a bounded number of recent RSS entries with full public vacancy details.
+        # Requests are throttled and failures fall back to the original RSS snippet.
+        semaphore = asyncio.Semaphore(4)
+        async def enrich_one(item: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                return await self._enrich_hh(item, headers)
+
+        detail_batch = gathered[:60]
+        if detail_batch:
+            enriched = await asyncio.gather(*(enrich_one(item) for item in detail_batch))
+            gathered[:len(enriched)] = enriched
+
         return gathered, (
-            "Публичная RSS-лента поиска HeadHunter; JSON API поиска вакансий "
-            "для неавторизованных запросов возвращает 403. RSS не требует регистрации "
-            "приложения или доступа работодателя; зарплата и график могут отсутствовать "
-            "в кратком описании и тогда вакансия попадёт на ручную проверку."
+            "HeadHunter: узкие запросы по расчёту зарплаты через публичную RSS-выдачу; "
+            "до 60 свежих карточек дополнительно обогащаются полным описанием через "
+            "официальный API вакансии. При ограничениях API сохраняется RSS-описание."
         )
 
     async def superjob(self) -> tuple[list[dict[str, Any]], str]:
