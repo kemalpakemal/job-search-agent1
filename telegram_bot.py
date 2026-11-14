@@ -225,11 +225,14 @@ def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | No
 
     viewed = _viewed_ids(db)
     rows = db.scalars(stmt).all()
+    legacy_viewed_statuses = {"saved", "applied-manually", "interview"}
     for job in rows:
         # "Пропустить" hides a vacancy from both browsing queues.
         if job.user_status == "rejected":
             continue
-        is_viewed = job.id in viewed
+        # Older bot versions did not store a viewed flag. User actions prove
+        # that those cards were already delivered and should not reappear as new.
+        is_viewed = job.id in viewed or job.user_status in legacy_viewed_statuses
         if bucket == "new" and not is_viewed:
             return job
         if bucket == "viewed" and is_viewed:
@@ -440,16 +443,19 @@ async def _handle_callback(update: dict[str, Any]) -> None:
                 if action == "save":
                     job.user_status = "saved"
                     db.commit()
+                    _mark_viewed(db, job.id)
                     await _answer_callback(callback_id, "Добавлено в избранное")
                     await _send(int(chat_id), "Добавил вакансию в «Избранное».", MAIN_MENU)
                 elif action == "applied":
                     job.user_status = "applied-manually"
                     db.commit()
+                    _mark_viewed(db, job.id)
                     await _answer_callback(callback_id, "Отметил как отправленный отклик")
                     await _send(int(chat_id), "Отметил вакансию как «Отклик отправлен». Автоматически ничего не отправлялось.", MAIN_MENU)
                 elif action == "interview":
                     job.user_status = "interview"
                     db.commit()
+                    _mark_viewed(db, job.id)
                     await _answer_callback(callback_id, "Отмечено приглашение")
                     await _send(int(chat_id), "Вакансия отмечена как «Приглашение на собеседование».", MAIN_MENU)
                 elif action == "skip":
