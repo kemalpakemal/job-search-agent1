@@ -251,7 +251,7 @@ def score_vacancy(vacancy: dict[str, Any]) -> tuple[int, list[str]]:
     score = min(score, 100)
     software_conflicts = required_software_conflicts(description)
     if software_conflicts:
-        deduction = min(30, len(software_conflicts) * 7)
+        deduction = min(8, len(software_conflicts) * 2)
         score = max(0, score - deduction)
         reasons.append(
             f"Снижение оценки на {deduction} баллов: не подтверждён опыт работы "
