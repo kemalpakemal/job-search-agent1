@@ -25,15 +25,17 @@ _offset = 0
 
 MAIN_MENU = {
     "keyboard": [
-        [{"text": "Найти вакансии"}, {"text": "Подходящие"}],
-        [{"text": "Проверить"}, {"text": "Сохранённые"}],
-        [{"text": "Статистика"}, {"text": "Настройки"}],
-        [{"text": "Источники"}, {"text": "Помощь"}],
+        [{"text": "Найти вакансии"}],
+        [{"text": "Новые"}, {"text": "Просмотренные"}],
+        [{"text": "⭐ Избранное"}],
+        [{"text": "Источники"}, {"text": "Настройки"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
     "input_field_placeholder": "Выбери действие",
 }
+
+VIEWED_VACANCIES_KEY = "telegram_viewed_vacancy_ids"
 
 
 def _api_url(method: str) -> str:
@@ -113,6 +115,34 @@ def _count(db, bucket: str | None = None, status: str | None = None) -> int:
     return int(db.scalar(stmt) or 0)
 
 
+def _viewed_ids(db) -> set[int]:
+    """Read the persistent set of vacancy cards already delivered to Telegram."""
+    row = db.get(AppSetting, VIEWED_VACANCIES_KEY)
+    if not row or not row.value:
+        return set()
+    try:
+        values = json.loads(row.value)
+        return {int(value) for value in values}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        log.warning("Viewed vacancy registry is malformed; treating it as empty")
+        return set()
+
+
+def _mark_viewed(db, vacancy_id: int) -> None:
+    """Persist the fact that a vacancy card was successfully sent to the user."""
+    viewed = _viewed_ids(db)
+    if vacancy_id in viewed:
+        return
+    viewed.add(int(vacancy_id))
+    row = db.get(AppSetting, VIEWED_VACANCIES_KEY)
+    value = json.dumps(sorted(viewed), ensure_ascii=False)
+    if row is None:
+        db.add(AppSetting(key=VIEWED_VACANCIES_KEY, value=value))
+    else:
+        row.value = value
+    db.commit()
+
+
 def _salary_text(job: Vacancy) -> str:
     def money(value: float) -> str:
         return f"{round(value):,}".replace(",", " ") + " ₽"
@@ -136,13 +166,26 @@ def _job_text(job: Vacancy, review: bool = False) -> str:
         f"Опыт: {job.experience or 'не указан'}\n"
         f"🎯 Соответствие: {job.score}/100"
     )
+    status_labels = {
+        "qualified": "Подходит по основным условиям",
+        "review": "Нужно уточнить отдельные требования",
+        "rejected": "Не прошло автоматические фильтры",
+    }
+    status_label = status_labels.get(job.bucket)
+    if status_label:
+        text += f"\nСтатус отбора: {status_label}"
+
     reasons = [x for x in (job.score_reasons or "").splitlines() if x]
-    if reasons:
+    if reasons and job.bucket != "rejected":
         text += "\n\nПочему подходит:\n• " + "\n• ".join(reasons[:3])
-    if review and job.review_reason:
+    elif reasons:
+        text += "\n\nЧто совпадает с резюме:\n• " + "\n• ".join(reasons[:3])
+
+    if job.review_reason:
         review_items = [item.strip(" .") for item in job.review_reason.split(";") if item.strip(" .")]
         if review_items:
-            text += "\n\n⚠️ Требует проверки:\n• " + "\n• ".join(review_items[:7])
+            heading = "Причина отсева" if job.bucket == "rejected" else "Требует проверки"
+            text += f"\n\n⚠️ {heading}:\n• " + "\n• ".join(review_items[:7])
     if job.description:
         desc = " ".join(job.description.split())[:650]
         if desc:
@@ -155,9 +198,10 @@ def _job_keyboard(job: Vacancy, bucket: str) -> dict[str, Any]:
     if job.url.startswith(("https://", "http://")):
         rows.append([{"text": "Открыть вакансию", "url": job.url}])
     rows.append([{"text": "📄 Сопроводительное письмо", "callback_data": f"letter:{job.id}"}])
+    save_label = "⭐ В избранном" if job.user_status == "saved" else "⭐ Сохранить"
     rows.append([
-        {"text": "⭐ Сохранить", "callback_data": f"save:{job.id}"},
-        {"text": "Пропустить", "callback_data": f"skip:{job.id}"},
+        {"text": save_label, "callback_data": f"save:{job.id}"},
+        {"text": "Пропустить", "callback_data": f"skip:{job.id}:{bucket}"},
     ])
     rows.append([{"text": "✅ Уже откликнулся", "callback_data": f"applied:{job.id}"}])
     rows.append([{"text": "Следующая ➡️", "callback_data": f"next:{bucket}:{job.id}"}])
@@ -165,54 +209,60 @@ def _job_keyboard(job: Vacancy, bucket: str) -> dict[str, Any]:
 
 
 def _get_next_job(db, bucket: str, before_id: int | None = None) -> Vacancy | None:
+    """Return the next card from the new, viewed or favorites queue."""
     stmt = select(Vacancy).order_by(desc(Vacancy.id))
-    if bucket == "saved":
-        stmt = stmt.where(Vacancy.user_status == "saved")
-    elif bucket == "review":
-        # Keep the review queue visible even if older records have a non-standard
-        # status value. Hide only explicit user decisions.
-        stmt = stmt.where(
-            Vacancy.bucket == "review",
-            or_(
-                Vacancy.user_status.is_(None),
-                ~Vacancy.user_status.in_(["rejected", "saved", "applied-manually", "interview"]),
-            ),
-        )
-    else:
-        # Legacy records with a NULL user status should remain visible until acted on.
-        stmt = stmt.where(
-            Vacancy.bucket == bucket,
-            or_(
-                Vacancy.user_status.is_(None),
-                Vacancy.user_status.in_(["new", "drafted"]),
-            ),
-        )
     if before_id is not None:
         stmt = stmt.where(Vacancy.id < before_id)
-    return db.scalars(stmt.limit(1)).first()
+
+    if bucket == "saved":
+        return db.scalars(
+            stmt.where(Vacancy.user_status == "saved").limit(1)
+        ).first()
+
+    if bucket not in {"new", "viewed"}:
+        # Compatibility with buttons sent by an older bot version.
+        bucket = "new"
+
+    viewed = _viewed_ids(db)
+    rows = db.scalars(stmt).all()
+    for job in rows:
+        # "Пропустить" hides a vacancy from both browsing queues.
+        if job.user_status == "rejected":
+            continue
+        is_viewed = job.id in viewed
+        if bucket == "new" and not is_viewed:
+            return job
+        if bucket == "viewed" and is_viewed:
+            return job
+    return None
 
 
 async def _show_next(chat_id: int, bucket: str, before_id: int | None = None) -> None:
     db = SessionLocal()
     try:
+        if bucket not in {"new", "viewed", "saved"}:
+            bucket = "new"
         job = _get_next_job(db, bucket, before_id)
         if not job:
             if before_id is not None:
-                message = "Это последняя вакансия в списке."
-            elif bucket == "review":
-                all_review = _count(db, bucket="review")
-                excluded = _count(db, bucket="review", status="rejected") + _count(db, bucket="review", status="saved") + _count(db, bucket="review", status="applied-manually") + _count(db, bucket="review", status="interview")
-                message = (
-                    "Очередь проверки сейчас пуста.\n"
-                    f"Всего вакансий в категории: {all_review}\n"
-                    f"Скрыто по ранее выбранным статусам: {excluded}\n"
-                    "Сохранённые вакансии доступны в разделе «Сохранённые»."
-                )
+                message = "Это последняя вакансия в этом списке."
+            elif bucket == "new":
+                message = "Новых вакансий для просмотра нет.\n\nЗапусти «Найти вакансии», чтобы проверить источники."
+            elif bucket == "viewed":
+                message = "Просмотренных вакансий пока нет.\n\nНовые карточки появятся здесь после того, как ты откроешь их в разделе «Новые»."
             else:
-                message = "В этой категории пока нет вакансий."
+                message = "Избранное пока пусто.\n\nНажимай «⭐ Сохранить» на понравившихся вакансиях."
             await _send(chat_id, message, MAIN_MENU)
             return
-        await _send(chat_id, _job_text(job, review=bucket == "review"), _job_keyboard(job, bucket))
+
+        await _send(
+            chat_id,
+            _job_text(job, review=job.bucket in {"review", "rejected"}),
+            _job_keyboard(job, bucket),
+        )
+        # Only cards sent from the "Новые" queue transition to "Просмотренные".
+        if bucket == "new":
+            _mark_viewed(db, job.id)
     finally:
         db.close()
 
@@ -251,18 +301,17 @@ async def _handle_message(update: dict[str, Any]) -> None:
     _remember_chat(int(chat_id), chat_type)
 
     command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
-    if command in {"/start", "/help", ""} and (command != "" or text in {"❔ Помощь"}):
-        if command == "/start":
-            await _send(
-                int(chat_id),
-                "Агент поиска работы запущен.\n\n"
-                f"Город: {settings.target_city}\nМинимум: {settings.min_net_salary:,} ₽ на руки\n"
-                "График: 5/2\nОценка совпадения: 90–100 для прямых зарплатных должностей\n\n"
-                "Отклики автоматически не отправляются. Ты просматриваешь вакансии и сам решаешь, что делать.",
-                MAIN_MENU,
-            )
-        else:
-            await _send(int(chat_id), "Команды:\n/search — поиск сейчас\n/jobs — подходящие\n/review — проверить\n/saved — сохранённые\n/stats — статистика\n/sources — источники\n/settings — параметры\n/id — твой ID", MAIN_MENU)
+    if command == "/start":
+        await _send(
+            int(chat_id),
+            "Агент поиска работы запущен.\n\n"
+            f"Город: {settings.target_city}\nМинимум: {settings.min_net_salary:,} ₽ на руки\n"
+            "График: 5/2\n\n"
+            "«Найти вакансии» запускает поиск. «Новые» показывает карточки, которые ещё не открывались. "
+            "После показа они переходят в «Просмотренные». Понравившиеся сохраняй в «Избранное».\n\n"
+            "Отклики автоматически не отправляются.",
+            MAIN_MENU,
+        )
         return
 
     if command in {"/search"} or text in {"Найти вакансии", "🔎 Найти вакансии"}:
@@ -277,27 +326,14 @@ async def _handle_message(update: dict[str, Any]) -> None:
         _search_task = asyncio.create_task(_run_search_for_chat(int(chat_id)), name=f"telegram-search-{chat_id}")
         return
 
-    if command in {"/jobs"} or text in {"Подходящие", "📋 Подходящие"}:
-        await _show_next(int(chat_id), "qualified")
+    if command in {"/new", "/jobs"} or text in {"Новые", "Показать новые"}:
+        await _show_next(int(chat_id), "new")
         return
-    if command in {"/review"} or text in {"Проверить", "🕵 Проверить"}:
-        await _show_next(int(chat_id), "review")
+    if command == "/viewed" or text == "Просмотренные":
+        await _show_next(int(chat_id), "viewed")
         return
-    if command in {"/saved"} or text in {"Сохранённые", "⭐ Сохранённые"}:
+    if command == "/saved" or text in {"⭐ Избранное", "Избранное", "Сохранённые"}:
         await _show_next(int(chat_id), "saved")
-        return
-    if command in {"/stats"} or text in {"Статистика", "📊 Статистика"}:
-        db = SessionLocal()
-        try:
-            total = _count(db)
-            qualified = _count(db, bucket="qualified")
-            review = _count(db, bucket="review")
-            saved = _count(db, status="saved")
-            latest = db.scalars(select(SearchRun).order_by(desc(SearchRun.id)).limit(1)).first()
-            last = latest.finished_at.strftime("%d.%m.%Y %H:%M UTC") if latest and latest.finished_at else "ещё не запускался"
-            await _send(int(chat_id), f"Статистика агента\n\nВсего вакансий: {total}\nПодходят: {qualified}\nНужна проверка: {review}\nСохранено: {saved}\nПоследний поиск: {last}\nАвтоотклики: выключены", MAIN_MENU)
-        finally:
-            db.close()
         return
     if command in {"/sources"} or text in {"Источники", "🔌 Источники"}:
         db = SessionLocal()
@@ -328,10 +364,6 @@ async def _handle_message(update: dict[str, Any]) -> None:
             MAIN_MENU,
         )
         return
-    if command == "/help" or text in {"Помощь", "❔ Помощь"}:
-        await _send(int(chat_id), "Команды: /search /jobs /review /saved /stats /sources /settings /id", MAIN_MENU)
-        return
-
 
 async def _run_search_for_chat(chat_id: int) -> None:
     """Run manual search in a background task without blocking Telegram polling."""
@@ -350,11 +382,10 @@ async def _run_search_for_chat(chat_id: int) -> None:
                 "Поиск завершён.\n"
                 f"Получено: {result.get('received', 0)}\nНовых: {result.get('inserted', 0)}\n"
                 f"Подходят: {result.get('qualified', 0)}\nНужна проверка: {result.get('review', 0)}\n"
-                f"Время: {elapsed} сек.\n\nОтклики не отправлялись.",
+                f"Время: {elapsed} сек.\n\nНажми «Новые», чтобы открыть найденные карточки. "
+                "После показа они попадут в «Просмотренные».\nОтклики не отправлялись.",
                 MAIN_MENU,
             )
-            if result.get("qualified", 0):
-                await _show_next(chat_id, "qualified")
     except asyncio.CancelledError:
         log.info("Manual Telegram search cancelled during shutdown")
         raise
@@ -392,9 +423,13 @@ async def _handle_callback(update: dict[str, Any]) -> None:
         action = parts[0]
         if action == "next" and len(parts) == 3:
             await _answer_callback(callback_id)
-            await _show_next(int(chat_id), parts[1], int(parts[2]))
+            queue = parts[1] if parts[1] in {"new", "viewed", "saved"} else "new"
+            await _show_next(int(chat_id), queue, int(parts[2]))
             return
-        if action in {"save", "skip", "letter", "applied", "interview"} and len(parts) == 2:
+        valid_action = (
+            action in {"save", "letter", "applied", "interview"} and len(parts) == 2
+        ) or (action == "skip" and len(parts) in {2, 3})
+        if valid_action:
             job_id = int(parts[1])
             db = SessionLocal()
             try:
@@ -405,8 +440,8 @@ async def _handle_callback(update: dict[str, Any]) -> None:
                 if action == "save":
                     job.user_status = "saved"
                     db.commit()
-                    await _answer_callback(callback_id, "Вакансия сохранена")
-                    await _send(int(chat_id), "Добавил вакансию в сохранённые.", MAIN_MENU)
+                    await _answer_callback(callback_id, "Добавлено в избранное")
+                    await _send(int(chat_id), "Добавил вакансию в «Избранное».", MAIN_MENU)
                 elif action == "applied":
                     job.user_status = "applied-manually"
                     db.commit()
@@ -421,7 +456,8 @@ async def _handle_callback(update: dict[str, Any]) -> None:
                     job.user_status = "rejected"
                     db.commit()
                     await _answer_callback(callback_id, "Вакансия скрыта")
-                    await _show_next(int(chat_id), job.bucket, job.id)
+                    queue = parts[2] if len(parts) == 3 and parts[2] in {"new", "viewed", "saved"} else "new"
+                    await _show_next(int(chat_id), queue, job.id)
                 else:
                     letter = job.cover_letter or "Сопроводительное письмо пока не сформировано."
                     await _answer_callback(callback_id, "Письмо готово")
@@ -491,11 +527,10 @@ async def start_telegram_bot(search_fn: SearchCallable) -> asyncio.Task | None:
         me = await _call("getMe")
         await _call("setMyCommands", {"commands": [
             {"command": "start", "description": "Открыть меню"},
-            {"command": "search", "description": "Найти новые вакансии"},
-            {"command": "jobs", "description": "Подходящие вакансии"},
-            {"command": "review", "description": "Вакансии на проверку"},
-            {"command": "saved", "description": "Сохранённые вакансии"},
-            {"command": "stats", "description": "Статистика поиска"},
+            {"command": "search", "description": "Запустить поиск"},
+            {"command": "new", "description": "Новые вакансии"},
+            {"command": "viewed", "description": "Просмотренные вакансии"},
+            {"command": "saved", "description": "Избранное"},
             {"command": "sources", "description": "Состояние источников"},
             {"command": "settings", "description": "Параметры поиска"},
             {"command": "id", "description": "Показать мой Telegram ID"},
