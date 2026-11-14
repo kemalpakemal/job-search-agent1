@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from sqlalchemy import desc, select, func, or_
 
 from config import settings
 from database import AppSetting, SessionLocal, Vacancy, SearchRun
+from scoring import build_cover_letter
 
 log = logging.getLogger("job-agent.telegram")
 SearchCallable = Callable[..., Awaitable[dict[str, Any]]]
@@ -88,7 +90,13 @@ async def _call(method: str, payload: dict[str, Any] | None = None) -> dict[str,
     return data.get("result") or {}
 
 
-async def _send(chat_id: int, text: str, reply_markup: dict[str, Any] | None = None, disable_preview: bool = True) -> None:
+async def _send(
+    chat_id: int,
+    text: str,
+    reply_markup: dict[str, Any] | None = None,
+    disable_preview: bool = True,
+    parse_mode: str | None = None,
+) -> None:
     payload: dict[str, Any] = {
         "chat_id": chat_id,
         "text": text[:4096],
@@ -96,7 +104,14 @@ async def _send(chat_id: int, text: str, reply_markup: dict[str, Any] | None = N
     }
     if reply_markup:
         payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     await _call("sendMessage", payload)
+
+
+def _letter_message(letter: str) -> str:
+    """Format the entire cover letter as one Telegram-native copyable code block."""
+    return "Сопроводительное письмо:\n\n<pre>" + html.escape(letter[:3500]) + "</pre>"
 
 
 async def _answer_callback(callback_id: str, text: str = "", alert: bool = False) -> None:
@@ -475,13 +490,18 @@ async def _handle_callback(update: dict[str, Any]) -> None:
                     queue = parts[2] if len(parts) == 3 and parts[2] in {"new", "viewed", "saved"} else "new"
                     await _show_next(int(chat_id), queue, job.id)
                 else:
-                    letter = job.cover_letter or "Сопроводительное письмо пока не сформировано."
+                    letter = build_cover_letter({
+                        "title": job.title,
+                        "employer": job.employer,
+                        "description": job.description,
+                    })
                     await _answer_callback(callback_id, "Письмо готово")
                     keyboard = {"inline_keyboard": [[{"text": "Открыть вакансию", "url": job.url}]]} if job.url.startswith(("https://", "http://")) else None
                     await _send(
                         int(chat_id),
-                        "Сопроводительное письмо:\n\n" + letter[:3500] + "\n\nНажми и удерживай текст, чтобы скопировать его. Перед отправкой проверь письмо.",
+                        _letter_message(letter),
                         keyboard,
+                        parse_mode="HTML",
                     )
             finally:
                 db.close()
