@@ -552,6 +552,7 @@ class VacancyConnectors:
         detail_semaphore = asyncio.Semaphore(4)
         detail_failures = 0
         detail_success = 0
+        detail_error_samples: list[str] = []
 
         async def enrich_from_page(item: dict[str, Any]) -> dict[str, Any]:
             nonlocal detail_failures, detail_success
@@ -624,8 +625,18 @@ class VacancyConnectors:
                             salary_line += " до вычета НДФЛ" if item["salary_type"] == "gross" else " на руки"
                     if salary_line:
                         item["description"] = (item.get("description", "") + "\n" + salary_line)[:12000]
-            except Exception:
+            except httpx.HTTPStatusError as exc:
                 detail_failures += 1
+                if len(detail_error_samples) < 2:
+                    detail_error_samples.append(
+                        f"HTTP {exc.response.status_code} при загрузке карточки"
+                    )
+            except Exception as exc:
+                detail_failures += 1
+                if len(detail_error_samples) < 2:
+                    detail_error_samples.append(
+                        f"{type(exc).__name__}: {str(exc)[:180]}"
+                    )
             return item
 
         if candidates:
@@ -638,8 +649,10 @@ class VacancyConnectors:
         )
         if detail_failures:
             note += f" Не удалось обогатить карточек: {detail_failures}."
-        if failures and successful_queries:
-            note += f" Ошибок поисковых запросов: {len(failures)}; пример: {failures[0][:180]}."
+            if detail_error_samples:
+                note += " Причины: " + " | ".join(detail_error_samples) + "."
+        if failures:
+            note += f" HTML-ошибок поиска: {len(failures)}; пример: {failures[0][:220]}."
         return list(unique.values()), note
 
     async def superjob(self) -> tuple[list[dict[str, Any]], str]:
