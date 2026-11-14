@@ -492,12 +492,10 @@ class VacancyConnectors:
         client_id = os.getenv("AVITO_CLIENT_ID", "").strip()
         client_secret = os.getenv("AVITO_CLIENT_SECRET", "").strip()
         location_id = os.getenv("AVITO_LOCATION_ID", "634450").strip()
-        # Each query is scoped to one focused payroll phrase. Default to one page per
-        # phrase to stay within Avito's API rate limit; raise AVITO_MAX_PAGES if needed.
         try:
-            max_pages = max(1, min(20, int(os.getenv("AVITO_MAX_PAGES", "1"))))
+            max_pages = max(1, min(50, int(os.getenv("AVITO_MAX_PAGES", "10"))))
         except ValueError:
-            max_pages = 1
+            max_pages = 10
 
         if not client_id or not client_secret:
             return [], (
@@ -569,141 +567,127 @@ class VacancyConnectors:
         total_pages_checked = 0
         category_notes: list[str] = []
 
+        # The documented vacancy-search endpoint supports only location, business_area,
+        # per_page and page. It does not accept a text query parameter.
         for business_area_id, business_area_name in business_areas:
+            page = 1
+            pages_reported = 1
             category_count = 0
-            category_pages = 0
-            successful_terms = 0
+            while page <= min(max_pages, pages_reported):
+                response = await self.client.get(
+                    "https://api.avito.ru/job/v2/vacancies",
+                    params={
+                        "location": location_id,
+                        "business_area": business_area_id,
+                        "per_page": 100,
+                        "page": page,
+                    },
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                rows = payload.get("vacancies", []) if isinstance(payload, dict) else []
+                meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+                try:
+                    pages_reported = max(1, int(meta.get("pages") or 1))
+                except (TypeError, ValueError):
+                    pages_reported = 1
 
-            # The official search method supports a query parameter. Searching by
-            # the candidate's exact payroll phrases prevents a broad accounting category
-            # from flooding the database with inventory, primary-documents and sales roles.
-            for term in PAYROLL_SEARCH_TERMS:
-                page = 1
-                pages_reported = 1
-                term_had_results = False
+                for row in rows if isinstance(rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    title = str(row.get("title") or row.get("profession") or "").strip()
+                    if not title:
+                        continue
 
-                while page <= min(max_pages, pages_reported):
-                    response = await self.client.get(
-                        "https://api.avito.ru/job/v2/vacancies",
-                        params={
-                            "query": term,
-                            "location": location_id,
-                            "business_area": business_area_id,
-                            "per_page": 100,
-                            "page": page,
-                        },
-                        headers=headers,
+                    address_details = row.get("addressDetails") or {}
+                    if not isinstance(address_details, dict):
+                        address_details = {}
+                    city = _structured_text(address_details.get("city")) or settings.target_city
+                    address = _structured_text(address_details.get("address"))
+                    raw_link = str(row.get("link") or "").strip()
+                    link = urljoin("https://www.avito.ru/", raw_link) if raw_link else ""
+                    if not link:
+                        continue
+
+                    external_id_match = re.search(r"(\d{7,})(?:\D*)$", raw_link)
+                    external_id = (
+                        external_id_match.group(1)
+                        if external_id_match
+                        else hashlib.sha256(link.encode("utf-8")).hexdigest()
                     )
-                    response.raise_for_status()
-                    payload = response.json()
-                    rows = payload.get("vacancies", []) if isinstance(payload, dict) else []
-                    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
-                    try:
-                        pages_reported = max(1, int(meta.get("pages") or 1))
-                    except (TypeError, ValueError):
-                        pages_reported = 1
+                    if external_id in seen:
+                        continue
+                    seen.add(external_id)
 
-                    for row in rows if isinstance(rows, list) else []:
-                        if not isinstance(row, dict):
-                            continue
-                        title = str(row.get("title") or row.get("profession") or "").strip()
-                        if not title:
-                            continue
+                    profession = _structured_text(row.get("profession"))
+                    company = _structured_text(row.get("companyName")) or "Работодатель не указан"
+                    category = _structured_text(row.get("businessArea")) or business_area_name
 
-                        address_details = row.get("addressDetails") or {}
-                        if not isinstance(address_details, dict):
-                            address_details = {}
-                        city = _structured_text(address_details.get("city")) or settings.target_city
-                        address = _structured_text(address_details.get("address"))
-                        raw_link = str(row.get("link") or "").strip()
-                        link = urljoin("https://www.avito.ru/", raw_link) if raw_link else ""
-                        if not link:
-                            continue
-
-                        external_id_match = re.search(r"(\d{7,})(?:\D*)$", raw_link)
-                        external_id = (
-                            external_id_match.group(1)
-                            if external_id_match
-                            else hashlib.sha256(link.encode("utf-8")).hexdigest()
+                    # Search cards can be sparse. Retain structured fields when present;
+                    # never infer missing salary, schedule, experience or tax treatment.
+                    params_obj = row.get("params") or {}
+                    if not isinstance(params_obj, dict):
+                        params_obj = {}
+                    salary_obj = params_obj.get("salary") or row.get("salary") or {}
+                    if not isinstance(salary_obj, dict):
+                        salary_obj = {}
+                    salary_min = _money(
+                        salary_obj.get("from") or salary_obj.get("min") or row.get("salary_from")
+                    )
+                    salary_max = _money(
+                        salary_obj.get("to") or salary_obj.get("max") or row.get("salary_to")
+                    )
+                    currency = salary_obj.get("currency") or row.get("currency")
+                    schedule = _structured_text(params_obj.get("schedule") or row.get("schedule"))
+                    experience = _structured_text(params_obj.get("experience") or row.get("experience"))
+                    detail_description = _structured_text(
+                        row.get("description") or row.get("text") or row.get("vacancyDescription")
+                    )
+                    description_parts = [
+                        detail_description,
+                        f"Профессия по классификатору Авито: {profession}" if profession else "",
+                        f"Сфера Авито: {category}",
+                        f"Адрес: {address}" if address else "",
+                    ]
+                    if not detail_description:
+                        description_parts.append(
+                            "Внимание: поисковая карточка Авито не содержит полного описания обязанностей. "
+                            "Проверьте условия на странице вакансии."
                         )
-                        if external_id in seen:
-                            continue
-                        seen.add(external_id)
 
-                        profession = _structured_text(row.get("profession"))
-                        company = _structured_text(row.get("companyName")) or "Работодатель не указан"
-                        category = _structured_text(row.get("businessArea")) or business_area_name
+                    gathered.append({
+                        "source": "Авито Работа",
+                        "external_id": external_id,
+                        "title": title,
+                        "employer": company,
+                        "city": city,
+                        "description": "\n".join(part for part in description_parts if part)[:12000],
+                        "salary_min": salary_min,
+                        "salary_max": salary_max,
+                        "currency": currency,
+                        "salary_type": classify_salary_type(detail_description),
+                        "schedule": schedule,
+                        "experience": experience,
+                        "published_at": row.get("createdAt") or row.get("publishedAt") or row.get("created"),
+                        "url": link,
+                    })
+                    category_count += 1
 
-                        # Search cards can be sparse. Retain structured fields when present;
-                        # never infer missing salary, schedule, experience or tax treatment.
-                        params_obj = row.get("params") or {}
-                        if not isinstance(params_obj, dict):
-                            params_obj = {}
-                        salary_obj = params_obj.get("salary") or row.get("salary") or {}
-                        if not isinstance(salary_obj, dict):
-                            salary_obj = {}
-                        salary_min = _money(
-                            salary_obj.get("from") or salary_obj.get("min") or row.get("salary_from")
-                        )
-                        salary_max = _money(
-                            salary_obj.get("to") or salary_obj.get("max") or row.get("salary_to")
-                        )
-                        currency = salary_obj.get("currency") or row.get("currency")
-                        schedule = _structured_text(params_obj.get("schedule") or row.get("schedule"))
-                        experience = _structured_text(params_obj.get("experience") or row.get("experience"))
-                        detail_description = _structured_text(
-                            row.get("description") or row.get("text") or row.get("vacancyDescription")
-                        )
-                        description_parts = [
-                            detail_description,
-                            f"Профессия по классификатору Авито: {profession}" if profession else "",
-                            f"Сфера Авито: {category}",
-                            f"Адрес: {address}" if address else "",
-                        ]
-                        if not detail_description:
-                            description_parts.append(
-                                "Внимание: поисковая карточка Авито не содержит полного описания обязанностей. "
-                                "Проверьте условия на странице вакансии."
-                            )
-
-                        gathered.append({
-                            "source": "Авито Работа",
-                            "external_id": external_id,
-                            "title": title,
-                            "employer": company,
-                            "city": city,
-                            "description": "\n".join(part for part in description_parts if part)[:12000],
-                            "salary_min": salary_min,
-                            "salary_max": salary_max,
-                            "currency": currency,
-                            "salary_type": classify_salary_type(detail_description),
-                            "schedule": schedule,
-                            "experience": experience,
-                            "published_at": row.get("createdAt") or row.get("publishedAt") or row.get("created"),
-                            "url": link,
-                        })
-                        category_count += 1
-                        term_had_results = True
-
-                    category_pages += 1
-                    total_pages_checked += 1
-                    if page >= pages_reported or page >= max_pages:
-                        break
-                    page += 1
-                    await asyncio.sleep(0.12)
-
-                if term_had_results:
-                    successful_terms += 1
+                total_pages_checked += 1
+                if page >= pages_reported or page >= max_pages:
+                    break
+                page += 1
+                await asyncio.sleep(0.12)
 
             category_notes.append(
-                f"{business_area_name}: {category_count} уникальных карточек; "
-                f"поисковых фраз с результатами — {successful_terms}/{len(PAYROLL_SEARCH_TERMS)}; "
-                f"запросов API — {category_pages}"
+                f"{business_area_name}: получено {category_count} карточек; "
+                f"просмотрено до {min(pages_reported, max_pages)} страниц"
             )
 
         return gathered, (
-            "Официальный Avito Job API: поиск в Сочи по точным фразам расчёта зарплаты "
-            "и актуальным категориям бухгалтерии/финансов. Выдача дедуплицирована. "
+            "Официальный Avito Job API: поиск по опубликованным вакансиям Сочи "
+            "в актуальных категориях бухгалтерии/финансов. Выдача дедуплицирована. "
             "Поисковый метод возвращает упрощённые карточки; подробная карточка вакансии "
             "через API доступна только владельцу объявления, поэтому отсутствующие поля "
             "остаются на ручную проверку. "
