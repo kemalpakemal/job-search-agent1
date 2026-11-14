@@ -149,8 +149,8 @@ class _EmailAlertHTMLParser(HTMLParser):
         self.current_link: dict[str, Any] | None = None
 
     def _newline(self) -> None:
-        if self.text_parts and self.text_parts[-1] != "\\n":
-            self.text_parts.append("\\n")
+        if self.text_parts and self.text_parts[-1] != "\n":
+            self.text_parts.append("\n")
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in self.BLOCK_TAGS:
@@ -165,7 +165,7 @@ class _EmailAlertHTMLParser(HTMLParser):
                 }
 
     def handle_data(self, data: str) -> None:
-        value = re.sub(r"\\s+", " ", data).strip()
+        value = re.sub(r"\s+", " ", data).strip()
         if not value:
             return
         self.text_parts.append(value + " ")
@@ -219,7 +219,7 @@ def _email_alert_title(anchor_text: str, context: str, url: str) -> str:
 
     lines = [
         " ".join(line.split()).strip(" •—-")
-        for line in re.split(r"[\\r\\n]+", context)
+        for line in re.split(r"[\r\n]+", context)
     ]
     skip = (
         "зарплат", "руб", "₽", "на руки", "до вычета", "отклик",
@@ -265,7 +265,7 @@ def _parse_email_alert_html(
     parser = _EmailAlertHTMLParser()
     parser.feed(html_body or "")
     visible_text = "".join(parser.text_parts)
-    visible_text = html_unescape(re.sub(r"\\n{3,}", "\\n\\n", visible_text))
+    visible_text = html_unescape(re.sub(r"\n{3,}", "\\n\\n", visible_text))
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -302,17 +302,17 @@ def _parse_email_alert_html(
             ),
             source,
         )
-        id_match = re.search(r"(\\d{6,})", parsed.path)
+        id_match = re.search(r"(\d{6,})", parsed.path)
         external_id = id_match.group(1) if id_match else hashlib.sha256(key.encode("utf-8")).hexdigest()
 
         salary_min, salary_max, currency, salary_type = _rss_salary(context)
-        schedule_match = re.search(r"(?i)(?<!\\d)(5\\s*/\\s*2|2\\s*/\\s*2|3\\s*/\\s*3|6\\s*/\\s*1)(?!\\d)", context)
-        schedule = re.sub(r"\\s+", "", schedule_match.group(1)) if schedule_match else ""
+        schedule_match = re.search(r"(?i)(?<!\d)(5\s*/\s*2|2\s*/\s*2|3\s*/\s*3|6\s*/\s*1)(?!\d)", context)
+        schedule = re.sub(r"\s+", "", schedule_match.group(1)) if schedule_match else ""
         experience_match = re.search(
-            r"(?i)(без опыта|опыт работы от [^,.;\\n]{1,45}|от [1-6] лет опыта)",
+            r"(?i)(без опыта|опыт работы от [^,.;\n]{1,45}|от [1-6] лет опыта)",
             context,
         )
-        employer_match = re.search(r"(?im)(?:компания|работодатель)\\s*[:—-]\\s*([^\\n]{2,100})", context)
+        employer_match = re.search(r"(?im)(?:компания|работодатель)\s*[:—-]\s*([^\n]{2,100})", context)
         description = (
             "Из почтовой подписки. Содержимое письма: "
             + " ".join(context.split())[:1500]
@@ -361,7 +361,7 @@ def _extract_email_body(message: email.message.Message) -> str:
             html_parts.append(payload)
         else:
             plain_parts.append(payload)
-    return "\\n".join(html_parts) if html_parts else "<pre>" + "\\n".join(plain_parts) + "</pre>"
+    return "\n".join(html_parts) if html_parts else "<pre>" + "\n".join(plain_parts) + "</pre>"
 
 
 
