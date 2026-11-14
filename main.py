@@ -31,6 +31,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("job-agent")
 scheduled_task: asyncio.Task | None = None
+# Manual Telegram/web requests and the periodic scheduler share one DB write path.
+search_lock = asyncio.Lock()
 
 
 def get_db():
@@ -286,7 +288,7 @@ def rescore_existing_review_vacancies() -> dict[str, int]:
         db.close()
 
 
-async def run_search(notify: bool = True) -> dict[str, Any]:
+async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
     db = SessionLocal()
     run = SearchRun()
     db.add(run)
@@ -361,6 +363,12 @@ async def run_search(notify: bool = True) -> dict[str, Any]:
     finally:
         await connector.close()
         db.close()
+
+
+async def run_search(notify: bool = True) -> dict[str, Any]:
+    """Serialize all search entry points to avoid duplicate-key DB write races."""
+    async with search_lock:
+        return await _run_search_unlocked(notify=notify)
 
 
 async def scheduled_search_loop():
