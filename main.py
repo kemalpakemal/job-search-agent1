@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import logging
+import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -452,7 +453,7 @@ async def sources(db: Session = Depends(get_db), _: bool = Depends(basic_auth)):
     statuses.setdefault("Работа России", "Ожидает запуска поиска")
     statuses.setdefault("Зарплата.ру", "Ручной поиск")
     statuses.setdefault("Работа.ру", "Ручной поиск")
-    statuses.setdefault("Авито Работа", "Ручной поиск")
+    statuses.setdefault("Авито Работа", "Официальный API: добавьте AVITO_CLIENT_ID и AVITO_CLIENT_SECRET для автоматического поиска")
     statuses.setdefault("Сайты работодателей", "Ручное добавление ссылок")
     saved_chat = db.get(AppSetting, "telegram_chat_id")
     return {"sources": statuses, "secrets_configured": {
@@ -461,6 +462,8 @@ async def sources(db: Session = Depends(get_db), _: bool = Depends(basic_auth)):
         "telegram_chat_configured": bool(settings.telegram_chat_id or (saved_chat and saved_chat.value)),
         "llm": bool(settings.llm_base_url and settings.llm_api_key and settings.llm_model),
         "hh_user_agent_customized": "set-contact-email-in-env" not in settings.hh_user_agent,
+        "avito_api_configured": bool(os.getenv("AVITO_CLIENT_ID", "").strip() and os.getenv("AVITO_CLIENT_SECRET", "").strip()),
+        "avito_location_configured": bool(os.getenv("AVITO_LOCATION_ID", "").strip()),
     }, "note": "Автоматические отклики выключены. Источники с ручным статусом не сканируются автоматически."}
 
 
