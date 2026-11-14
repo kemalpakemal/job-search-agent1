@@ -298,7 +298,7 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
     db.commit()
     db.refresh(run)
     connector = VacancyConnectors()
-    inserted = qualified = review = 0
+    inserted = updated = qualified = review = rejected = 0
     new_qualified_ids: list[int] = []
     try:
         items, source_status = await connector.run_all()
@@ -315,32 +315,41 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
             if existing:
                 raw["city"] = safe_city(raw.get("city"))
                 refresh_existing_vacancy(existing, raw, threshold)
-                continue
-            city = safe_city(raw.get("city"))
-            raw["city"] = city
-            score, reasons, net_min, bucket, review_reason = evaluate_vacancy(raw, threshold)
-            job = Vacancy(
-                source=source, external_id=external_id,
-                title=str(raw.get("title") or "Без названия")[:500],
-                employer=str(raw.get("employer") or "Работодатель не указан")[:500],
-                city=city[:300], description=str(raw.get("description") or "")[:12000],
-                salary_min=raw.get("salary_min"), salary_max=raw.get("salary_max"),
-                currency=raw.get("currency"), salary_type=raw.get("salary_type") or "unknown",
-                net_min_estimate=net_min, schedule=str(raw.get("schedule") or "")[:200],
-                experience=str(raw.get("experience") or "")[:200],
-                published_at=str(raw.get("published_at") or "")[:80], url=str(raw.get("url") or ""),
-                score=score, score_reasons="\n".join(reasons), bucket=bucket,
-                review_reason=review_reason, cover_letter=build_cover_letter(raw),
-                first_seen=now, last_seen=now,
-            )
-            db.add(job)
-            db.flush()
-            inserted += 1
-            if bucket == "qualified":
+                job = existing
+                updated += 1
+            else:
+                city = safe_city(raw.get("city"))
+                raw["city"] = city
+                score, reasons, net_min, bucket, review_reason = evaluate_vacancy(raw, threshold)
+                job = Vacancy(
+                    source=source, external_id=external_id,
+                    title=str(raw.get("title") or "Без названия")[:500],
+                    employer=str(raw.get("employer") or "Работодатель не указан")[:500],
+                    city=city[:300], description=str(raw.get("description") or "")[:12000],
+                    salary_min=raw.get("salary_min"), salary_max=raw.get("salary_max"),
+                    currency=raw.get("currency"), salary_type=raw.get("salary_type") or "unknown",
+                    net_min_estimate=net_min, schedule=str(raw.get("schedule") or "")[:200],
+                    experience=str(raw.get("experience") or "")[:200],
+                    published_at=str(raw.get("published_at") or "")[:80], url=str(raw.get("url") or ""),
+                    score=score, score_reasons="\n".join(reasons), bucket=bucket,
+                    review_reason=review_reason, cover_letter=build_cover_letter(raw),
+                    first_seen=now, last_seen=now,
+                )
+                db.add(job)
+                db.flush()
+                inserted += 1
+
+            # Counters describe every vacancy returned in this search, not just
+            # first-time database inserts. Existing rows were re-scored above.
+            if job.bucket == "qualified":
                 qualified += 1
-                new_qualified_ids.append(job.id)
-            elif bucket == "review":
+                if existing is None:
+                    new_qualified_ids.append(job.id)
+            elif job.bucket == "review":
                 review += 1
+            else:
+                rejected += 1
+
         run.received = len(items)
         run.inserted = inserted
         run.qualified = qualified
@@ -348,13 +357,17 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
         run.source_status = json.dumps(source_status, ensure_ascii=False)
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
-        if notify and qualified and new_qualified_ids:
+        if notify and new_qualified_ids:
             fresh = db.scalars(select(Vacancy).where(Vacancy.id.in_(new_qualified_ids)).order_by(desc(Vacancy.first_seen)).limit(5)).all()
-            lines = [f"Поиск завершён. Новых подходящих вакансий в этом запуске: {qualified}. Всего новых: {inserted}.", "Отклики не отправлялись — только подготовка и сохранение."]
+            lines = [f"Поиск завершён. Впервые добавлено подходящих вакансий: {len(new_qualified_ids)}. Всего получено: {len(items)}.", "Отклики не отправлялись — только подготовка и сохранение."]
             for item in fresh:
                 lines.append(f"\n{item.title} — {item.employer}\nNET от: {round(item.net_min_estimate or 0):,} ₽; соответствие: {item.score}/100\n{item.url}".replace(",", " "))
             await send_telegram("\n".join(lines))
-        return {"received": len(items), "inserted": inserted, "qualified": qualified, "review": review, "sources": source_status}
+        return {
+            "received": len(items), "inserted": inserted, "updated": updated,
+            "qualified": qualified, "review": review, "rejected": rejected,
+            "sources": source_status,
+        }
     except Exception as exc:
         db.rollback()
         run.error = f"{type(exc).__name__}: {exc}"

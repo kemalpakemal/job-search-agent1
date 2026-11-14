@@ -130,6 +130,21 @@ def _count(db, bucket: str | None = None, status: str | None = None) -> int:
     return int(db.scalar(stmt) or 0)
 
 
+def _queue_counts_for_jobs(jobs: list[Any], viewed_ids: set[int]) -> dict[str, int]:
+    """Count all profile-relevant cards in New and Viewed, independent of search-run inserts."""
+    legacy_viewed_statuses = {"saved", "applied-manually", "interview"}
+    new_count = viewed_count = 0
+    for job in jobs:
+        if job.bucket not in {"qualified", "review"} or job.user_status == "rejected":
+            continue
+        is_viewed = job.id in viewed_ids or job.user_status in legacy_viewed_statuses
+        if is_viewed:
+            viewed_count += 1
+        else:
+            new_count += 1
+    return {"new": new_count, "viewed": viewed_count}
+
+
 def _viewed_ids(db) -> set[int]:
     """Read the persistent set of vacancy cards already delivered to Telegram."""
     row = db.get(AppSetting, VIEWED_VACANCIES_KEY)
@@ -273,9 +288,12 @@ async def _show_next(chat_id: int, bucket: str, before_id: int | None = None) ->
         job = _get_next_job(db, bucket, before_id)
         if not job:
             if before_id is not None:
-                message = "Это последняя вакансия в этом списке."
+                message = (
+                    "В этой очереди больше нет следующих карточек.\n\n"
+                    "Уже показанные вакансии можно открыть через «Просмотренные»."
+                )
             elif bucket == "new":
-                message = "Новых вакансий для просмотра нет.\n\nЗапусти «Найти вакансии», чтобы проверить источники."
+                message = "Новых вакансий для просмотра нет.\n\nЗапусти «Найти вакансии», чтобы проверить источники, или открой «Просмотренные»."
             elif bucket == "viewed":
                 message = "Просмотренных вакансий пока нет.\n\nНовые карточки появятся здесь после того, как ты откроешь их в разделе «Новые»."
             else:
@@ -405,15 +423,37 @@ async def _run_search_for_chat(chat_id: int) -> None:
             started = asyncio.get_running_loop().time()
             result = await search_fn(notify=False)
             elapsed = int(asyncio.get_running_loop().time() - started)
-            await _send(
-                chat_id,
+            db = SessionLocal()
+            try:
+                browsable_jobs = db.scalars(
+                    select(Vacancy).where(Vacancy.bucket.in_(["qualified", "review"]))
+                ).all()
+                queue_counts = _queue_counts_for_jobs(browsable_jobs, _viewed_ids(db))
+            finally:
+                db.close()
+
+            rejected_count = result.get("rejected", 0)
+            report = (
                 "Поиск завершён.\n"
-                f"Получено от источников: {result.get('received', 0)}\nДобавлено в базу: {result.get('inserted', 0)}\n"
-                f"Подходят: {result.get('qualified', 0)}\nНужна проверка: {result.get('review', 0)}\n"
-                f"Время: {elapsed} сек.\n\nНажми «Новые», чтобы открыть найденные карточки. "
-                "После показа они попадут в «Просмотренные».\nОтклики не отправлялись.",
-                MAIN_MENU,
+                f"Получено от источников: {result.get('received', 0)}\n"
+                f"Впервые добавлено в базу: {result.get('inserted', 0)}\n"
+                f"Уже было в базе и обновлено: {result.get('updated', 0)}\n"
+                f"Подходят по профилю и условиям: {result.get('qualified', 0)}\n"
+                f"Нужна ручная проверка: {result.get('review', 0)}\n"
+                f"Отсеяно фильтрами: {rejected_count}\n\n"
+                "Сейчас в очередях бота:\n"
+                f"Новые: {queue_counts['new']}\n"
+                f"Просмотренные: {queue_counts['viewed']}\n"
+                f"Время: {elapsed} сек.\n\n"
             )
+            if queue_counts["new"]:
+                report += "Нажми «Новые», чтобы открыть ещё не просмотренные подходящие вакансии."
+            elif queue_counts["viewed"]:
+                report += "Новых карточек нет: подходящие вакансии уже находятся в «Просмотренных»."
+            else:
+                report += "В очередях нет подходящих карточек. Остальные результаты отсеяны фильтрами или требуют повторной проверки источника."
+            report += "\nОтклики не отправлялись."
+            await _send(chat_id, report, MAIN_MENU)
     except asyncio.CancelledError:
         log.info("Manual Telegram search cancelled during shutdown")
         raise
