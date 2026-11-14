@@ -159,6 +159,84 @@ def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str
     return score, score_reasons, net_min, bucket, "; ".join(review_reasons)
 
 
+def refresh_existing_vacancy(job: Vacancy, raw: dict[str, Any], threshold: int) -> None:
+    """Refresh a stored vacancy from the latest source card without resetting user actions."""
+    now = datetime.now(timezone.utc)
+    job.last_seen = now
+
+    incoming_title = str(raw.get("title") or "").strip()
+    if incoming_title:
+        job.title = incoming_title[:500]
+
+    incoming_employer = str(raw.get("employer") or "").strip()
+    if incoming_employer and incoming_employer != "Работодатель не указан":
+        job.employer = incoming_employer[:500]
+
+    incoming_city = safe_city(raw.get("city"))
+    if incoming_city:
+        job.city = incoming_city[:300]
+
+    incoming_description = str(raw.get("description") or "").strip()
+    current_description = str(job.description or "")
+    placeholder_description = "внимание: поиск-метод авито возвращает краткую карточку"
+    if incoming_description and (
+        len(incoming_description) > len(current_description)
+        or (placeholder_description in current_description.lower()
+            and placeholder_description not in incoming_description.lower())
+    ):
+        job.description = incoming_description[:12000]
+
+    for field, limit in (("schedule", 200), ("experience", 200)):
+        incoming = str(raw.get(field) or "").strip()
+        current = str(getattr(job, field) or "").strip()
+        if incoming and (not current or len(incoming) > len(current)):
+            setattr(job, field, incoming[:limit])
+
+    # Update numerical salary data only when the source actually supplies it.
+    for field in ("salary_min", "salary_max", "currency"):
+        incoming = raw.get(field)
+        if incoming not in (None, ""):
+            setattr(job, field, incoming)
+
+    incoming_salary_type = str(raw.get("salary_type") or "").strip().lower()
+    if incoming_salary_type in {"net", "gross"}:
+        job.salary_type = incoming_salary_type
+
+    incoming_published = str(raw.get("published_at") or "").strip()
+    if incoming_published:
+        job.published_at = incoming_published[:80]
+
+    incoming_url = str(raw.get("url") or "").strip()
+    if incoming_url:
+        job.url = incoming_url
+
+    merged = {
+        "title": job.title,
+        "description": job.description,
+        "city": job.city,
+        "schedule": job.schedule,
+        "salary_min": job.salary_min,
+        "salary_max": job.salary_max,
+        "currency": job.currency,
+        "salary_type": job.salary_type,
+        "experience": job.experience,
+    }
+    score, reasons, net_min, bucket, review_reason = evaluate_vacancy(merged, threshold)
+    job.score = score
+    job.score_reasons = "\n".join(reasons)
+    job.net_min_estimate = net_min
+    job.bucket = bucket
+    job.review_reason = review_reason
+
+    # Keep any existing user-written or previously drafted letter intact.
+    if not job.cover_letter:
+        job.cover_letter = build_cover_letter({
+            "title": job.title,
+            "employer": job.employer,
+            "description": job.description,
+        })
+
+
 def rescore_existing_review_vacancies() -> dict[str, int]:
     """Re-evaluate unseen vacancies using the complete candidate-profile rules."""
     db = SessionLocal()
@@ -229,7 +307,8 @@ async def run_search(notify: bool = True) -> dict[str, Any]:
             existing = db.scalar(select(Vacancy).where(Vacancy.source == source, Vacancy.external_id == external_id))
             now = datetime.now(timezone.utc)
             if existing:
-                existing.last_seen = now
+                raw["city"] = safe_city(raw.get("city"))
+                refresh_existing_vacancy(existing, raw, threshold)
                 continue
             city = safe_city(raw.get("city"))
             raw["city"] = city
