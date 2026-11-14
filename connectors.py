@@ -203,6 +203,35 @@ def _parse_hh_initial_state(page: bytes | str) -> dict[str, Any]:
     return state
 
 
+def _hh_find_value(root: Any, keys: tuple[str, ...]) -> Any:
+    """Find a populated field in nested HH SSR data using ordered field-name aliases."""
+    wanted = {key.lower() for key in keys}
+    stack = [root]
+    visited = 0
+    while stack and visited < 12000:
+        node = stack.pop()
+        visited += 1
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if str(key).lower() in wanted and value not in (None, "", [], {}):
+                    if isinstance(value, (str, int, float)):
+                        return value
+                    if isinstance(value, dict):
+                        for child_key in ("text", "html", "content", "value", "description"):
+                            child = value.get(child_key)
+                            if isinstance(child, (str, int, float)) and child not in (None, ""):
+                                return child
+            # Preserve natural insertion order while traversing nested objects.
+            for value in reversed(list(node.values())):
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(node, list):
+            for value in reversed(node):
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+    return None
+
+
 def _hh_display(value: Any) -> str:
     """Extract a human-readable label from HH dictionaries/lists without leaking IDs."""
     if isinstance(value, dict):
@@ -290,11 +319,17 @@ def _hh_search_item_to_vacancy(item: dict[str, Any], area_name: str) -> dict[str
     area = item.get("area") or {}
     compensation = item.get("compensation") or item.get("salary") or {}
     snippet = item.get("snippet") or {}
-    description = _compact_description(
-        snippet.get("req") or snippet.get("requirement"),
-        snippet.get("resp") or snippet.get("responsibility"),
-        snippet.get("cond") or snippet.get("conditions"),
+    raw_description = _hh_find_value(
+        item,
+        ("descriptionText", "descriptionHtml", "description_text", "description_html", "description"),
     )
+    description = _rss_plain_text(raw_description or "")
+    if not description:
+        description = _compact_description(
+            snippet.get("req") or snippet.get("requirement"),
+            snippet.get("resp") or snippet.get("responsibility"),
+            snippet.get("cond") or snippet.get("conditions"),
+        )
     salary_type = classify_salary_type(
         description,
         explicit_gross=compensation.get("gross") if isinstance(compensation.get("gross"), bool) else None,
@@ -553,10 +588,12 @@ class VacancyConnectors:
         detail_semaphore = asyncio.Semaphore(4)
         detail_failures = 0
         detail_success = 0
+        detail_missing_description = 0
         detail_error_samples: list[str] = []
+        detail_empty_samples: list[str] = []
 
         async def enrich_from_page(item: dict[str, Any]) -> dict[str, Any]:
-            nonlocal detail_failures, detail_success
+            nonlocal detail_failures, detail_success, detail_missing_description
             vacancy_id = item["external_id"]
             try:
                 async with detail_semaphore:
@@ -577,8 +614,26 @@ class VacancyConnectors:
                     raise RuntimeError("В карточке HH не найден vacancyView")
                 nested = view.get("vacancy") if isinstance(view.get("vacancy"), dict) else {}
                 detail = {**view, **nested}
-                raw_description = detail.get("description") or view.get("description")
+                raw_description = _hh_find_value(
+                    detail,
+                    (
+                        "descriptionText", "descriptionHtml", "description_text", "description_html",
+                        "description", "vacancyDescription", "vacancy_description",
+                        "brandedDescription", "branded_description",
+                    ),
+                )
                 description = _rss_plain_text(raw_description or "")
+                if not description:
+                    # Some HH page versions keep the body outside vacancyView.vacancy.
+                    raw_description = _hh_find_value(
+                        state,
+                        (
+                            "descriptionText", "descriptionHtml", "description_text", "description_html",
+                            "description", "vacancyDescription", "vacancy_description",
+                            "brandedDescription", "branded_description",
+                        ),
+                    )
+                    description = _rss_plain_text(raw_description or "")
                 skills = detail.get("keySkills") or detail.get("key_skills") or []
                 skill_names = [_hh_display(x) for x in skills]
                 skill_names = [x for x in skill_names if x]
@@ -587,6 +642,14 @@ class VacancyConnectors:
                 if description:
                     item["description"] = description[:12000]
                     detail_success += 1
+                else:
+                    detail_missing_description += 1
+                    if len(detail_empty_samples) < 2:
+                        view_keys = list(view.keys())[:24]
+                        nested_keys = list(nested.keys())[:24] if nested else []
+                        detail_empty_samples.append(
+                            f"vacancyView keys={view_keys}; nested keys={nested_keys}"
+                        )
                 employer = detail.get("company") or detail.get("employer")
                 if employer:
                     item["employer"] = _hh_display(employer) or item["employer"]
@@ -649,9 +712,13 @@ class VacancyConnectors:
             f"полные описания получены — {detail_success}."
         )
         if detail_failures:
-            note += f" Не удалось обогатить карточек: {detail_failures}."
+            note += f" Не удалось открыть карточек: {detail_failures}."
             if detail_error_samples:
                 note += " Причины: " + " | ".join(detail_error_samples) + "."
+        if detail_missing_description:
+            note += f" Открыты, но без распознанного поля описания: {detail_missing_description}."
+            if detail_empty_samples:
+                note += " Доступные поля: " + " | ".join(detail_empty_samples) + "."
         if failures:
             note += f" HTML-ошибок поиска: {len(failures)}; пример: {failures[0][:220]}."
         return list(unique.values()), note
