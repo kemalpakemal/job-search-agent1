@@ -29,7 +29,7 @@ MAIN_MENU = {
     "keyboard": [
         [{"text": "Найти вакансии"}],
         [{"text": "Новые"}, {"text": "Просмотренные"}],
-        [{"text": "⭐ Избранное"}],
+        [{"text": "❤️ Избранное"}],
         [{"text": "Источники"}, {"text": "Настройки"}],
     ],
     "resize_keyboard": True,
@@ -360,7 +360,7 @@ async def _handle_message(update: dict[str, Any]) -> None:
     if command == "/viewed" or text == "Просмотренные":
         await _show_next(int(chat_id), "viewed")
         return
-    if command == "/saved" or text in {"⭐ Избранное", "Избранное", "Сохранённые"}:
+    if command == "/saved" or text in {"❤️ Избранное", "Избранное", "Сохранённые"}:
         await _show_next(int(chat_id), "saved")
         return
     if command in {"/sources"} or text in {"Источники", "🔌 Источники"}:
