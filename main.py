@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 from config import PROFILE, settings
 from connectors import VacancyConnectors
 from database import AppSetting, SearchRun, SessionLocal, Vacancy
-from scoring import build_cover_letter, salary_decision, score_vacancy
+from scoring import (build_cover_letter, salary_decision, score_vacancy, is_profile_relevant, has_experience_conflict, has_training_offer)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 # HTTPX logs full Telegram Bot API URLs, which contain the bot token.
@@ -84,18 +84,73 @@ def safe_city(value: Any) -> str:
     return str(value or "")
 
 
+def evaluate_vacancy(raw: dict[str, Any], threshold: int) -> tuple[int, list[str], float | None, str, str]:
+    """One consistent decision path for fresh vacancies and re-scoring."""
+    score, score_reasons = score_vacancy(raw)
+    if not is_profile_relevant(raw):
+        reason = "Не соответствует резюме: работа не связана напрямую с расчётом заработной платы"
+        return score, score_reasons, None, "rejected", reason
+
+    salary_bucket, net_min, salary_reason = salary_decision(
+        raw.get("salary_min"), raw.get("salary_max"), raw.get("currency"),
+        raw.get("salary_type") or "unknown", threshold
+    )
+    city = safe_city(raw.get("city"))
+    city_ok = "сочи" in city.lower()
+    city_unknown = not city.strip()
+    schedule_text = str(raw.get("schedule") or "").lower()
+    schedule_known_ok = any(
+        marker in schedule_text
+        for marker in ("5/2", "пятиднев", "пн-пт", "понедельник-пятница", "понедельник по пятницу")
+    )
+    schedule_conflict = any(
+        marker in schedule_text
+        for marker in ("2/2", "3/3", "сутки через", "вахт", "сменный график", "свободный график")
+    )
+    experience_text = f"{raw.get('experience') or ''} {raw.get('description') or ''}"
+    training = has_training_offer(experience_text)
+    experience_conflict = has_experience_conflict(experience_text)
+
+    review_reasons: list[str] = []
+    if not city_ok:
+        review_reasons.append("Город в вакансии не указан" if city_unknown else "Вакансия указана не в Сочи")
+    if salary_reason:
+        review_reasons.append(salary_reason)
+    if schedule_conflict:
+        review_reasons.append("Указан график, отличный от требуемого 5/2")
+    elif not schedule_known_ok:
+        review_reasons.append("График 5/2 не подтверждён в данных вакансии")
+    if training:
+        score_reasons.append("Работодатель предлагает обучение или готов рассматривать без опыта")
+    elif experience_conflict:
+        review_reasons.append("В вакансии указано требование от 5 лет опыта; у кандидата подтверждено 4 года")
+
+    if salary_bucket == "rejected":
+        bucket = "rejected"
+    elif city and not city_ok:
+        bucket = "rejected"
+    elif schedule_conflict:
+        bucket = "rejected"
+    elif salary_bucket == "qualified" and city_ok and schedule_known_ok and not experience_conflict:
+        bucket = "qualified"
+    else:
+        bucket = "review"
+
+    return score, score_reasons, net_min, bucket, "; ".join(review_reasons)
+
+
 def rescore_existing_review_vacancies() -> dict[str, int]:
-    """Re-evaluate existing unseen review records after a scoring-rule deployment."""
+    """Re-evaluate unseen vacancies using the complete candidate-profile rules."""
     db = SessionLocal()
     checked = promoted = rejected = 0
     try:
         threshold = int(setting_value(db, "min_net_salary", str(settings.min_net_salary)))
         rows = db.scalars(
             select(Vacancy).where(
-                Vacancy.bucket == "review",
+                Vacancy.bucket.in_(["review", "qualified"]),
                 or_(
                     Vacancy.user_status.is_(None),
-                    ~Vacancy.user_status.in_(["rejected", "saved", "applied-manually", "interview"]),
+                    Vacancy.user_status.in_(["new", "drafted"]),
                 ),
             )
         ).all()
@@ -111,46 +166,17 @@ def rescore_existing_review_vacancies() -> dict[str, int]:
                 "salary_type": job.salary_type,
                 "experience": job.experience,
             }
-            score, reasons = score_vacancy(raw)
-            salary_bucket, net_min, salary_reason = salary_decision(
-                job.salary_min, job.salary_max, job.currency, job.salary_type or "unknown", threshold
-            )
-            city_ok = "сочи" in (job.city or "").lower()
-            schedule_text = (job.schedule or "").lower()
-            schedule_known_ok = any(
-                marker in schedule_text
-                for marker in ("5/2", "пятиднев", "пн-пт", "понедельник-пятница")
-            )
-            review_reasons: list[str] = []
-            if not city_ok:
-                review_reasons.append("Город в данных источника не подтверждён как Сочи")
-            if salary_reason:
-                review_reasons.append(salary_reason)
-            if not schedule_known_ok:
-                review_reasons.append("График 5/2 не подтверждён в данных вакансии")
-            experience_text = ((job.experience or "") + " " + (job.description or "")).lower()
-            if any(term in experience_text for term in (
-                "от 5 лет", "5 лет опыта", "не менее 5 лет", "от пяти лет"
-            )):
-                review_reasons.append("Работодатель может требовать больше подтверждённых четырёх лет опыта")
-            if score < 80:
-                review_reasons.append(f"Оценка соответствия ниже порога 80/100: {score}")
-
-            if salary_bucket == "rejected":
-                bucket = "rejected"
-                rejected += 1
-            elif salary_bucket == "qualified" and city_ok and schedule_known_ok and score >= 80:
-                bucket = "qualified"
-                promoted += 1
-            else:
-                bucket = "review"
-
+            score, reasons, net_min, bucket, review_reason = evaluate_vacancy(raw, threshold)
             job.score = score
             job.score_reasons = "\n".join(reasons)
             job.net_min_estimate = net_min
             job.bucket = bucket
-            job.review_reason = "; ".join(review_reasons)
+            job.review_reason = review_reason
             checked += 1
+            if bucket == "qualified":
+                promoted += 1
+            elif bucket == "rejected":
+                rejected += 1
 
         db.commit()
         return {"checked": checked, "promoted": promoted, "rejected": rejected}
@@ -187,32 +213,7 @@ async def run_search(notify: bool = True) -> dict[str, Any]:
                 continue
             city = safe_city(raw.get("city"))
             raw["city"] = city
-            score, reasons = score_vacancy(raw)
-            salary_bucket, net_min, salary_reason = salary_decision(
-                raw.get("salary_min"), raw.get("salary_max"), raw.get("currency"),
-                raw.get("salary_type") or "unknown", threshold
-            )
-            city_ok = "сочи" in city.lower()
-            schedule_text = str(raw.get("schedule") or "").lower()
-            schedule_known_ok = any(x in schedule_text for x in ("5/2", "пятиднев", "пн-пт", "понедельник-пятница"))
-            review_reasons = []
-            if not city_ok:
-                review_reasons.append("Город в данных источника не подтверждён как Сочи")
-            if salary_reason:
-                review_reasons.append(salary_reason)
-            if not schedule_known_ok:
-                review_reasons.append("График 5/2 не подтверждён в данных вакансии")
-            experience_text = (str(raw.get("experience") or "") + " " + str(raw.get("description") or "")).lower()
-            if any(term in experience_text for term in ("от 5 лет", "5 лет опыта", "не менее 5 лет", "от пяти лет")):
-                review_reasons.append("Работодатель может требовать больше подтверждённых четырёх лет опыта")
-            if score < 80:
-                review_reasons.append(f"Оценка соответствия ниже порога 80/100: {score}")
-            if salary_bucket == "rejected":
-                bucket = "rejected"
-            elif salary_bucket == "qualified" and city_ok and schedule_known_ok and score >= 80:
-                bucket = "qualified"
-            else:
-                bucket = "review"
+            score, reasons, net_min, bucket, review_reason = evaluate_vacancy(raw, threshold)
             job = Vacancy(
                 source=source, external_id=external_id,
                 title=str(raw.get("title") or "Без названия")[:500],
@@ -224,7 +225,7 @@ async def run_search(notify: bool = True) -> dict[str, Any]:
                 experience=str(raw.get("experience") or "")[:200],
                 published_at=str(raw.get("published_at") or "")[:80], url=str(raw.get("url") or ""),
                 score=score, score_reasons="\n".join(reasons), bucket=bucket,
-                review_reason="; ".join(review_reasons), cover_letter=build_cover_letter(raw),
+                review_reason=review_reason, cover_letter=build_cover_letter(raw),
                 first_seen=now, last_seen=now,
             )
             db.add(job)
