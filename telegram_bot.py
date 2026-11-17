@@ -438,7 +438,7 @@ async def _run_search_for_chat(chat_id: int) -> None:
             if search_fn is None:
                 await _send(chat_id, "Функция поиска не инициализирована. Проверь журнал сервера.", MAIN_MENU)
                 return
-            result = await search_fn(notify=False)
+            result = await search_fn(notify=True)
             db = SessionLocal()
             try:
                 browsable_jobs = db.scalars(

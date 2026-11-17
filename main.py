@@ -54,9 +54,11 @@ def basic_auth(request: Request, credentials: HTTPBasicCredentials | None = Depe
     return True
 
 
-async def send_telegram(text: str) -> None:
+async def send_telegram(text: str) -> bool:
+    """Send a Telegram notification and report delivery so failed alerts can be retried."""
     if not settings.telegram_bot_token:
-        return
+        log.warning("Telegram notification skipped: bot token is not configured")
+        return False
     chat_id = settings.telegram_chat_id.strip()
     if not chat_id:
         # The Telegram bot stores the authorized private chat after /start.
@@ -67,13 +69,23 @@ async def send_telegram(text: str) -> None:
         finally:
             db.close()
     if not chat_id:
-        return
+        log.warning("Telegram notification skipped: private chat is not registered")
+        return False
     url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    async with httpx.AsyncClient(timeout=15) as client:
-        try:
-            await client.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-        except Exception as exc:
-            log.warning("Telegram notification failed (%s)", type(exc).__name__)
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                url,
+                json={"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": True},
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError("Telegram API rejected sendMessage")
+            return True
+    except Exception as exc:
+        log.warning("Telegram notification failed (%s); it will be retried", type(exc).__name__)
+        return False
 
 
 def setting_value(db: Session, key: str, default: str) -> str:
@@ -312,6 +324,7 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
             source = raw.get("source") or "unknown"
             existing = db.scalar(select(Vacancy).where(Vacancy.source == source, Vacancy.external_id == external_id))
             now = datetime.now(timezone.utc)
+            was_qualified = bool(existing and existing.bucket == "qualified")
             if existing:
                 raw["city"] = safe_city(raw.get("city"))
                 refresh_existing_vacancy(existing, raw, threshold)
@@ -343,8 +356,11 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
             # first-time database inserts. Existing rows were re-scored above.
             if job.bucket == "qualified":
                 qualified += 1
-                if existing is None:
-                    new_qualified_ids.append(job.id)
+                # Alert on first discovery or when a previously review-only card
+                # becomes a confirmed profile match after re-scoring.
+                if (existing is None or not was_qualified) and job.user_status != "rejected":
+                    if job.id not in new_qualified_ids:
+                        new_qualified_ids.append(job.id)
             elif job.bucket == "review":
                 review += 1
             else:
@@ -356,13 +372,59 @@ async def _run_search_unlocked(notify: bool = True) -> dict[str, Any]:
         run.review = review
         run.source_status = json.dumps(source_status, ensure_ascii=False)
         run.finished_at = datetime.now(timezone.utc)
+
+        # Keep undelivered alerts in the database. A temporary Telegram outage
+        # must not make a newly discovered vacancy disappear from notifications.
+        notification_key = "pending_qualified_vacancy_notifications"
+        notification_row = db.get(AppSetting, notification_key)
+        pending_ids: list[int] = []
+        if notification_row and notification_row.value:
+            try:
+                pending_ids = [int(value) for value in json.loads(notification_row.value)]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pending_ids = []
+        pending_ids = list(dict.fromkeys(pending_ids + new_qualified_ids))
+        if notification_row is None and pending_ids:
+            notification_row = AppSetting(key=notification_key, value=json.dumps(pending_ids))
+            db.add(notification_row)
+        elif notification_row is not None:
+            notification_row.value = json.dumps(pending_ids)
         db.commit()
-        if notify and new_qualified_ids:
-            fresh = db.scalars(select(Vacancy).where(Vacancy.id.in_(new_qualified_ids)).order_by(desc(Vacancy.first_seen)).limit(5)).all()
-            lines = [f"Поиск завершён. Впервые добавлено подходящих вакансий: {len(new_qualified_ids)}. Всего получено: {len(items)}.", "Отклики не отправлялись — только подготовка и сохранение."]
-            for item in fresh:
-                lines.append(f"\n{item.title} — {item.employer}\nNET от: {round(item.net_min_estimate or 0):,} ₽; соответствие: {item.score}/100\n{item.url}".replace(",", " "))
-            await send_telegram("\n".join(lines))
+
+        if notify and pending_ids:
+            pending_jobs = db.scalars(
+                select(Vacancy)
+                .where(Vacancy.id.in_(pending_ids))
+                .order_by(desc(Vacancy.first_seen))
+            ).all()
+            fresh = [
+                item for item in pending_jobs
+                if item.bucket == "qualified" and item.user_status != "rejected"
+            ]
+            # Drop entries that are no longer suitable; retain the rest if Telegram fails.
+            if len(fresh) != len(pending_ids):
+                valid_ids = [item.id for item in fresh]
+                if notification_row is not None:
+                    notification_row.value = json.dumps(valid_ids)
+                    db.commit()
+            if fresh:
+                lines = [f"Новые подходящие вакансии: {len(fresh)}."]
+                for item in fresh[:5]:
+                    salary = (
+                        f"на руки от {round(item.net_min_estimate):,} ₽".replace(",", " ")
+                        if item.net_min_estimate is not None else "зарплата не указана"
+                    )
+                    lines.append(
+                        f"\n{item.title} — {item.employer}"
+                        f"\n{salary}; соответствие: {item.score}/100"
+                        f"\n{item.url}"
+                    )
+                if len(fresh) > 5:
+                    lines.append(f"\nЕщё {len(fresh) - 5} — в разделе «Новые» бота.")
+                if await send_telegram("\n".join(lines)):
+                    if notification_row is not None:
+                        notification_row.value = "[]"
+                        db.commit()
         return {
             "received": len(items), "inserted": inserted, "updated": updated,
             "qualified": qualified, "review": review, "rejected": rejected,
@@ -388,8 +450,12 @@ async def run_search(notify: bool = True) -> dict[str, Any]:
 
 
 async def scheduled_search_loop():
-    # Built-in asyncio scheduler: no external scheduler service is required.
-    # It runs only while this single application process is alive.
+    # Check as soon as the service starts, then repeat at the configured interval.
+    # This makes newly configured sources (for example, SuperJob) test immediately.
+    try:
+        await run_search()
+    except Exception:
+        log.exception("Initial scheduled search failed")
     while True:
         await asyncio.sleep(max(1, settings.search_interval_hours) * 3600)
         try:
